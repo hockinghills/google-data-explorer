@@ -1,0 +1,11 @@
+name = "google-data-explorer"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Set these in Cloudflare dashboard under Settings > Variables
+# or uncomment and fill in here:
+#
+# [vars]
+# GOOGLE_CLIENT_ID = "your-client-id.apps.googleusercontent.com"
+# GOOGLE_CLIENT_SECRET = "your-client-secret"
+# REDIRECT_URI = "https://google-data-explorer.empyreanbuilders.workers.dev/callback"
