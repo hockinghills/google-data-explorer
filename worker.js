@@ -167,6 +167,33 @@ async function initiateArchives(url, env) {
   const token = url.searchParams.get('ptoken');
   if (!token) return jsonResponse({ error: 'No portability token' }, 401);
 
+  // Fix: Read and persist selection order — this shapes the graph
+  const ALLOWED_CARD_IDS = ['contacts', 'calendar', 'gmail', 'youtube', 'music', 'fitness', 'tasks', 'drive'];
+  let selectionOrder = [];
+  try {
+    const orderParam = url.searchParams.get('order');
+    if (orderParam) {
+      const parsed = JSON.parse(orderParam);
+      if (Array.isArray(parsed)) {
+        selectionOrder = [...new Set(parsed.filter(id => ALLOWED_CARD_IDS.includes(id)))].slice(0, 8);
+      }
+    }
+  } catch { /* invalid JSON, ignore */ }
+
+  // Persist selection order to graph as meta node
+  if (selectionOrder.length > 0) {
+    try {
+      await neo4jQuery(env,
+        `MERGE (o:Onboarding {id: 'current'})
+         SET o.selectionOrder = $order, o.updatedAt = datetime()`,
+        { order: selectionOrder }
+      );
+    } catch (e) {
+      // Non-fatal — log but continue with archive initiation
+      console.error('Failed to persist selection order:', e.message);
+    }
+  }
+
   const jobs = [];
   const errors = [];
 
@@ -191,7 +218,7 @@ async function initiateArchives(url, env) {
     }
   }
 
-  return jsonResponse({ jobs, errors, initiated: new Date().toISOString() });
+  return jsonResponse({ jobs, errors, selectionOrder, initiated: new Date().toISOString() });
 }
 
 async function archiveStatus(url, env) {
@@ -920,39 +947,46 @@ function richnessBars(richness) {
   ).join('');
 }
 
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function renderExplorer(cards, token, ptoken) {
   const cardHtml = cards.map(card => {
     if (card.error && !card.service) return '';
     const color = recencyColor(card.latest);
     const recency = formatDate(card.latest);
     const p = card.preview || {};
-    const id = card.id || card.service.toLowerCase().replace(/\s+/g, '_');
+    const id = card.id || card.service.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const esc = escapeHtml;
 
     if (card.error) {
-      return `<div class="card unavailable" data-id="${id}">
+      return `<div class="card unavailable" data-id="${esc(id)}">
         <div class="card-header">
           <span class="icon">${card.icon || '📊'}</span>
-          <span class="service-name">${card.service}</span>
+          <span class="service-name">${esc(card.service)}</span>
         </div>
         <div class="card-error">unavailable</div>
       </div>`;
     }
 
-    return `<div class="card" data-id="${id}" onclick="toggleCard(this, '${id}')">
+    return `<div class="card" data-id="${esc(id)}" onclick="toggleCard(this, '${esc(id)}')">
       <div class="card-badge"></div>
       <div class="card-header">
         <span class="icon">${card.icon || '📊'}</span>
-        <span class="service-name">${card.service}</span>
-        <span class="recency-dot" style="background:${color}" title="${recency}"></span>
+        <span class="service-name">${esc(card.service)}</span>
+        <span class="recency-dot" style="background:${color}" title="${esc(recency)}"></span>
       </div>
-      <div class="card-headline">${p.headline || card.total || ''}</div>
-      ${p.detail ? `<div class="card-detail">${p.detail}</div>` : ''}
-      ${p.stat ? `<div class="card-stat">${p.stat}</div>` : ''}
+      <div class="card-headline">${esc(p.headline || card.total || '')}</div>
+      ${p.detail ? `<div class="card-detail">${esc(p.detail)}</div>` : ''}
+      ${p.stat ? `<div class="card-stat">${esc(p.stat)}</div>` : ''}
       <div class="card-footer">
-        <span class="card-recency">${recency}</span>
+        <span class="card-recency">${esc(recency)}</span>
         <span class="card-richness">${richnessBars(card.richness)}</span>
       </div>
-      ${card.description ? `<div class="card-desc">${card.description}</div>` : ''}
+      ${card.description ? `<div class="card-desc">${esc(card.description)}</div>` : ''}
     </div>`;
   }).join('');
 
@@ -1056,8 +1090,8 @@ ${cards.length > 0 ? `<div class="grid">${cardHtml}</div>` : ''}
 </div>
 
 <script>
-const token = '${token || ''}';
-const ptoken = '${ptoken || ''}';
+const token = ${JSON.stringify(token || '')};
+const ptoken = ${JSON.stringify(ptoken || '')};
 let selections = []; // ordered list of selected card IDs
 
 function toggleCard(el, id) {
