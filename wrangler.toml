@@ -2,14 +2,12 @@ name = "google-data-explorer"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Set these via `npx wrangler secret put <NAME>` or in Cloudflare dashboard:
-#
-# [vars]
-# GOOGLE_CLIENT_ID = "your-client-id.apps.googleusercontent.com"
-# GOOGLE_CLIENT_SECRET = "your-client-secret"
-# REDIRECT_URI = "https://google-data-explorer.your-subdomain.workers.dev/callback"
-# PORTABILITY_REDIRECT_URI = "https://google-data-explorer.your-subdomain.workers.dev/callback/portability"
-# NEO4J_URI = "neo4j+s://xxx.databases.neo4j.io"
-# NEO4J_USERNAME = "neo4j"
-# NEO4J_PASSWORD = "your-password"
-# NEO4J_DATABASE = "neo4j"
+# Secrets already configured via Cloudflare API:
+#   GOOGLE_CLIENT_ID
+#   GOOGLE_CLIENT_SECRET
+#   REDIRECT_URI = https://google-data-explorer.empyreanbuilders.workers.dev/callback
+#   PORTABILITY_REDIRECT_URI = https://google-data-explorer.empyreanbuilders.workers.dev/callback/portability
+#   NEO4J_URI
+#   NEO4J_USERNAME
+#   NEO4J_PASSWORD
+#   NEO4J_DATABASE
