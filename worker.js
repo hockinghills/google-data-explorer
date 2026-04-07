@@ -229,9 +229,30 @@ async function processArchives(url, env) {
   if (!token) return jsonResponse({ error: 'No portability token' }, 401);
   if (!archiveUrl) return jsonResponse({ error: 'No archive URL' }, 400);
 
+  // Fix: Validate archive URL is from Google storage (prevent SSRF/open proxy)
+  const ALLOWED_HOSTS = ['storage.googleapis.com', 'storage.cloud.google.com', 'www.googleapis.com'];
   try {
-    const res = await fetch(archiveUrl);
+    const parsed = new URL(archiveUrl);
+    if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h))) {
+      return jsonResponse({ error: 'Archive URL must be from Google storage' }, 403);
+    }
+  } catch {
+    return jsonResponse({ error: 'Invalid archive URL' }, 400);
+  }
+
+  try {
+    // Fix: Use ptoken for auth on the archive download
+    const res = await fetch(archiveUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!res.ok) return jsonResponse({ error: `Download failed: ${res.status}` }, 500);
+
+    // Fix: Check Content-Length to prevent unbounded memory usage (128MB limit)
+    const MAX_SIZE = 128 * 1024 * 1024;
+    const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
+    if (contentLength > MAX_SIZE) {
+      return jsonResponse({ error: `Archive too large: ${(contentLength / 1024 / 1024).toFixed(0)}MB (max 128MB)` }, 413);
+    }
 
     const contentType = res.headers.get('content-type') || '';
     let activities = [];
@@ -293,6 +314,9 @@ async function processArchives(url, env) {
 // Edges: THEN (sequential), ABOUT (topic), AT (hour), ON (day), USING (product)
 
 async function ensureGraphSchema(url, env) {
+  // Fix: require auth — this writes to Neo4j
+  const token = url.searchParams.get('token') || url.searchParams.get('ptoken');
+  if (!token) return jsonResponse({ error: 'Authentication required' }, 401);
   try {
     const indexes = [
       'CREATE INDEX activity_id IF NOT EXISTS FOR (a:Activity) ON (a.id)',
@@ -439,6 +463,9 @@ function hashCode(str) {
 // ---- GRAPH STATS ----
 
 async function graphStats(url, env) {
+  // Fix: require auth — this reads from Neo4j
+  const token = url.searchParams.get('token') || url.searchParams.get('ptoken');
+  if (!token) return jsonResponse({ error: 'Authentication required' }, 401);
   try {
     const result = await neo4jQuery(env,
       `OPTIONAL MATCH (a:Activity) WITH count(a) AS activities
@@ -467,7 +494,15 @@ async function neo4jQuery(env, statement, parameters = {}) {
     headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ statement, parameters }),
   });
-  return res.json();
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Neo4j HTTP ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const result = await res.json();
+  if (result.errors && result.errors.length > 0) {
+    throw new Error(`Neo4j query error: ${JSON.stringify(result.errors[0])}`);
+  }
+  return result;
 }
 
 // ---- LAYER 1: LIVE DATA FETCHERS ----
@@ -842,7 +877,7 @@ let archiveJobs = [];
 async function checkGraphStatus() {
   try {
     const [g, s] = await Promise.all([
-      fetch('/graph/stats').then(r => r.json()).catch(() => null),
+      fetch('/graph/stats?token=' + (token || ptoken)).then(r => r.json()).catch(() => null),
       fetch('/ingest/status').then(r => r.json()).catch(() => null),
     ]);
     const el = document.getElementById('graphStatus');
@@ -865,7 +900,7 @@ async function startDeepImport() {
   btn.textContent = 'initiating archives...';
   status.textContent = 'requesting data export from google...';
   try {
-    await fetch('/graph/schema');
+    await fetch('/graph/schema?ptoken=' + encodeURIComponent(ptoken));
     const res = await fetch('/portability/initiate?ptoken=' + encodeURIComponent(ptoken));
     const data = await res.json();
     if (data.jobs?.length > 0) {
