@@ -372,7 +372,7 @@ async function scanTakeout() {
       var fileList = files.map(function(f) {
         return '<div class="takeout-cat-file" title="' + f.name + '">' + f.name + ' (' + f.sizeMB + ' MB)</div>';
       }).join('') + (s.fileCount > 5 ? '<div class="takeout-cat-file">... +' + (s.fileCount - 5) + ' more</div>' : '');
-      var ingestBtn = s.graphReady && key !== 'archive'
+      var ingestBtn = s.graphReady
         ? '<button class="takeout-ingest-btn" onclick="ingestCategory(\\'' + key + '\\', this)">add to graph</button>'
         : '<button class="takeout-ingest-btn" disabled>not yet available</button>';
       return '<div class="takeout-cat' + (s.graphReady ? ' ready' : '') + '" data-cat="' + key + '">'

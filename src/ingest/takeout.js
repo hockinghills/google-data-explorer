@@ -1,7 +1,7 @@
 import { fetchGoogle } from '../helpers/google.js';
 import { jsonResponse } from '../helpers/response.js';
 import { ingestActivitiesToGraph } from '../graph/ingest.js';
-import { unzipSync } from 'fflate';
+import { unzipSync, Unzip, UnzipInflate } from 'fflate';
 
 // Takeout archive folder patterns in Drive
 const TAKEOUT_FOLDER_QUERY = "name contains 'takeout' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
@@ -159,7 +159,7 @@ export async function discoverTakeout(url, env) {
       catalog[key] = { ...meta, files: [], totalSizeMB: 0, fileCount: 0 };
     }
     // Add archive category
-    catalog.archive = { label: 'ZIP Archives', icon: '📦', graphReady: false, files: [], totalSizeMB: 0, fileCount: 0 };
+    catalog.archive = { label: 'ZIP Archives (activity data inside)', icon: '📦', graphReady: true, files: [], totalSizeMB: 0, fileCount: 0 };
 
     for (const f of allFiles) {
       const cat = categorizeFile(f.name, f.mimeType);
@@ -282,34 +282,34 @@ export async function processTakeout(url, env) {
     const obj = await env.ARCHIVES.get(key);
     if (!obj) return jsonResponse({ error: 'Archive not found in storage' }, 404);
 
-    const sizeBytes = obj.size;
-    const MAX_PROCESS_SIZE = 512 * 1024 * 1024;
-    if (sizeBytes > MAX_PROCESS_SIZE) {
-      return jsonResponse({
-        error: `File too large for processing: ${(sizeBytes / (1024 * 1024)).toFixed(0)}MB`,
-        hint: 'Re-export with smaller file size setting',
-      }, 413);
+    // Peek at first 2 bytes to detect format
+    // For JSON files: read fully (they're small enough)
+    // For ZIPs: stream (they can be 2GB+)
+    const isZipName = key.endsWith('.zip') || key.endsWith('.tgz');
+
+    if (isZipName) {
+      return streamProcessZip(obj, key, env);
     }
 
+    // JSON file — read into memory (timeline files are ~50MB max, well within limits)
     const arrayBuf = await obj.arrayBuffer();
     const bytes = new Uint8Array(arrayBuf);
-
-    // Detect file type: ZIP starts with PK (0x50 0x4B), JSON starts with [ or {
-    const isZip = bytes[0] === 0x50 && bytes[1] === 0x4B;
     const firstChar = String.fromCharCode(bytes[0]);
-    const isJson = firstChar === '[' || firstChar === '{';
 
-    if (isZip) {
-      return processZipArchive(bytes, key, env);
-    } else if (isJson) {
+    if (firstChar === '[' || firstChar === '{') {
       const resource = resourceFromPath(key);
       return processJsonFile(arrayBuf, key, resource, env);
-    } else {
-      return jsonResponse({
-        error: 'Unknown file format',
-        magic: Array.from(bytes.slice(0, 4)).map(b => b.toString(16)).join(' '),
-      }, 422);
     }
+
+    // Check if it's actually a ZIP despite the name
+    if (bytes[0] === 0x50 && bytes[1] === 0x4B) {
+      return processSmallZip(bytes, key, env);
+    }
+
+    return jsonResponse({
+      error: 'Unknown file format',
+      magic: Array.from(bytes.slice(0, 4)).map(b => b.toString(16)).join(' '),
+    }, 422);
   } catch (e) {
     console.error('Process takeout failed:', e.message);
     return jsonResponse({ error: 'Processing failed' }, 500);
@@ -436,7 +436,119 @@ async function processTimelineData(data, key, env) {
   });
 }
 
-async function processZipArchive(zipData, key, env) {
+// Stream a large ZIP from R2, extracting only activity JSONs
+async function streamProcessZip(r2Object, key, env) {
+  const results = [];
+  let totalActivities = 0;
+  let filesFound = 0;
+  let activityFilesFound = 0;
+
+  return new Promise(async (resolve) => {
+    const uz = new Unzip();
+    uz.register(UnzipInflate);
+
+    const pendingFiles = [];
+
+    uz.onfile = (file) => {
+      filesFound++;
+      const path = file.name;
+
+      // Skip non-activity files (photos, videos, mbox, etc.)
+      if (!isActivityFile(path)) {
+        // Must still drain the file to keep the stream flowing
+        file.ondata = () => {};
+        file.start();
+        return;
+      }
+
+      activityFilesFound++;
+      const chunks = [];
+
+      file.ondata = (err, data, final) => {
+        if (err) {
+          results.push({ path, error: err.message || 'decompression error' });
+          return;
+        }
+        if (data) chunks.push(data);
+        if (final) {
+          // Combine chunks into full file
+          const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+          const full = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const chunk of chunks) { full.set(chunk, offset); offset += chunk.length; }
+
+          pendingFiles.push({ path, data: full });
+        }
+      };
+      file.start();
+    };
+
+    // Read the R2 stream in chunks and feed to Unzip
+    const reader = r2Object.body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          uz.push(new Uint8Array(0), true);
+          break;
+        }
+        uz.push(value);
+      }
+    } catch (e) {
+      resolve(jsonResponse({ error: 'Stream read failed: ' + e.message }, 500));
+      return;
+    }
+
+    // Now process all collected activity files
+    for (const { path, data } of pendingFiles) {
+      const resource = resourceFromPath(path);
+      try {
+        const text = new TextDecoder().decode(data);
+        let parsed = JSON.parse(text);
+        let activities = Array.isArray(parsed) ? parsed : [parsed];
+
+        if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
+          const inner = Object.values(activities[0]);
+          if (Array.isArray(inner[0])) activities = inner[0];
+        }
+
+        if (activities.length === 0) continue;
+
+        const result = await ingestActivitiesToGraph(activities, resource, env);
+        totalActivities += activities.length;
+        results.push({
+          path, resource,
+          activities: activities.length,
+          nodesCreated: result.nodesCreated,
+          chainsCreated: result.chainsCreated,
+          topicsLinked: result.topicsLinked,
+        });
+      } catch (e) {
+        results.push({ path, resource, error: e.message });
+      }
+    }
+
+    await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
+      processedAt: new Date().toISOString(),
+      filesFound,
+      activityFilesFound,
+      totalActivities,
+      results,
+    }));
+
+    resolve(jsonResponse({
+      success: true,
+      format: 'zip-streamed',
+      filesInArchive: filesFound,
+      activityFilesFound,
+      totalActivities,
+      results,
+    }));
+  });
+}
+
+// Process a small ZIP that fits in memory (fallback)
+async function processSmallZip(zipData, key, env) {
   let entries;
   try {
     entries = unzipSync(zipData);
