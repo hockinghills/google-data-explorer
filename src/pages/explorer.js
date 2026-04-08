@@ -166,17 +166,21 @@ function renderExplorer(cards, token, ptoken) {
 
 ${cards.length > 0 ? '<div class="grid">' + cardHtml + '</div>' : ''}
 
-<div class="takeout-section" id="takeoutSection">
+${token ? `<div class="takeout-section" id="takeoutSection">
   <h2 class="takeout-title">your archive</h2>
   <div class="takeout-subtitle">google takeout data sitting in your drive — scan it, pick what goes into the graph</div>
   <button class="takeout-scan-btn" id="takeoutScanBtn" onclick="scanTakeout()">scan drive for takeout data</button>
   <div class="takeout-status" id="takeoutStatus"></div>
   <div class="takeout-catalog" id="takeoutCatalog"></div>
-</div>
+</div>` : ''}
 
 <script>
 const token = ${JSON.stringify(token || '')};
 const ptoken = ${JSON.stringify(ptoken || '')};
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 
 const BUBBLE_COLORS = {
   songs: '#8b5cf6', artists: '#a78bfa', activities: '#6366f1',
@@ -370,7 +374,7 @@ async function scanTakeout() {
         ? '<span class="takeout-cat-badge">graph ready</span>'
         : '<span class="takeout-cat-badge not-ready">coming soon</span>';
       var fileList = files.map(function(f) {
-        return '<div class="takeout-cat-file" title="' + f.name + '">' + f.name + ' (' + f.sizeMB + ' MB)</div>';
+        return '<div class="takeout-cat-file" title="' + escHtml(f.name) + '">' + escHtml(f.name) + ' (' + f.sizeMB + ' MB)</div>';
       }).join('') + (s.fileCount > 5 ? '<div class="takeout-cat-file">... +' + (s.fileCount - 5) + ' more</div>' : '');
       var ingestBtn = s.graphReady
         ? '<button class="takeout-ingest-btn" onclick="ingestCategory(\\'' + key + '\\', this)">add to graph</button>'
@@ -405,12 +409,12 @@ async function ingestCategory(catKey, btn) {
     for (var i = 0; i < cat.files.length; i++) {
       var file = cat.files[i];
       btn.textContent = 'staging ' + (i + 1) + '/' + cat.files.length + '...';
-      var stageRes = await fetch('/takeout/stage?token=' + encodeURIComponent(token) + '&fileId=' + encodeURIComponent(file.id));
+      var stageRes = await fetch('/takeout/stage?token=' + encodeURIComponent(token) + '&fileId=' + encodeURIComponent(file.id), { method: 'POST' });
       var stageData = await stageRes.json();
       if (!stageData.success) { btn.textContent = 'stage failed'; btn.classList.add('error'); return; }
 
       btn.textContent = 'processing ' + (i + 1) + '/' + cat.files.length + '...';
-      var processRes = await fetch('/takeout/process?token=' + encodeURIComponent(token) + '&key=' + encodeURIComponent(stageData.key));
+      var processRes = await fetch('/takeout/process?token=' + encodeURIComponent(token) + '&key=' + encodeURIComponent(stageData.key), { method: 'POST' });
       var processData = await processRes.json();
       if (processData.success) ingested++;
     }
