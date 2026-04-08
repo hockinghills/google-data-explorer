@@ -3,6 +3,19 @@ import { jsonResponse } from '../helpers/response.js';
 import { ingestActivitiesToGraph } from '../graph/ingest.js';
 import { unzipSync, Unzip, UnzipInflate } from 'fflate';
 
+// Derive a per-user R2 prefix from the OAuth token (first 16 chars of SHA-256 hex)
+async function userPrefix(token) {
+  const data = new TextEncoder().encode(token);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  const hex = Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 16);
+}
+
+// Sanitize a filename for use as an R2 key component
+function sanitizeFilename(name) {
+  return name.replace(/[\/\\:\x00]/g, '_').replace(/\.\./g, '_').slice(0, 255);
+}
+
 // Takeout archive folder patterns in Drive
 const TAKEOUT_FOLDER_QUERY = "name contains 'takeout' and mimeType = 'application/vnd.google-apps.folder' and trashed = false";
 const TAKEOUT_ZIP_QUERY = "name contains 'takeout' and (mimeType = 'application/zip' or mimeType = 'application/x-zip-compressed') and trashed = false";
@@ -94,7 +107,7 @@ function categorizeFile(name, mimeType) {
   if (n.includes('drive')) return 'drive_files';
 
   // ZIP archives get their own handling
-  if (m.includes('zip') || /\.zip$/i.test(n) || /\.tgz$/i.test(n)) return 'archive';
+  if (m.includes('zip') || /\.zip$/i.test(n)) return 'archive';
 
   return 'other';
 }
@@ -204,7 +217,8 @@ export async function discoverTakeout(url, env) {
     // Check R2 for already-staged files
     let staged = [];
     try {
-      const list = await env.ARCHIVES.list({ prefix: 'takeout/' });
+      const prefix = await userPrefix(token);
+      const list = await env.ARCHIVES.list({ prefix: `takeout/${prefix}/` });
       staged = list.objects.map(o => ({
         key: o.key,
         sizeMB: (o.size / (1024 * 1024)).toFixed(1),
@@ -221,7 +235,8 @@ export async function discoverTakeout(url, env) {
       staged,
     });
   } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+    console.error('Discover takeout failed:', e);
+    return jsonResponse({ error: 'Failed to discover Takeout archives' }, 500);
   }
 }
 
@@ -252,7 +267,7 @@ export async function stageTakeout(url, env) {
       return jsonResponse({ error: `Drive download failed: ${driveRes.status}` }, 500);
     }
 
-    const r2Key = `takeout/${meta.name}`;
+    const r2Key = `takeout/${await userPrefix(token)}/${sanitizeFilename(meta.name)}`;
     await env.ARCHIVES.put(r2Key, driveRes.body, {
       httpMetadata: { contentType: meta.mimeType },
       customMetadata: { driveFileId: fileId, originalSize: String(sizeBytes) },
@@ -277,6 +292,12 @@ export async function processTakeout(url, env) {
   const key = url.searchParams.get('key');
   if (!token) return jsonResponse({ error: 'No token' }, 401);
   if (!key) return jsonResponse({ error: 'No key' }, 400);
+
+  // Validate the key belongs to this user
+  const prefix = await userPrefix(token);
+  if (!key.startsWith(`takeout/${prefix}/`)) {
+    return jsonResponse({ error: 'Archive not found' }, 403);
+  }
 
   try {
     const obj = await env.ARCHIVES.get(key);
@@ -320,7 +341,8 @@ async function processJsonFile(arrayBuf, key, resource, env) {
   const text = new TextDecoder().decode(arrayBuf);
   let data;
   try { data = JSON.parse(text); } catch (e) {
-    return jsonResponse({ error: 'JSON parse failed', details: e.message }, 422);
+    console.error('JSON parse failed:', e);
+    return jsonResponse({ error: 'JSON parse failed — file may be corrupted or in an unexpected format' }, 422);
   }
 
   // Handle Maps Timeline format (has timelineObjects or semanticSegments)
@@ -358,21 +380,25 @@ async function processJsonFile(arrayBuf, key, resource, env) {
   });
 }
 
-async function processTimelineData(data, key, env) {
-  // Maps Timeline can come in different formats depending on export date
+// Detect whether a parsed JSON object is Maps Timeline data
+function isTimelineData(data) {
+  if (data.timelineObjects || data.semanticSegments) return true;
+  if (Array.isArray(data) && data.length > 0 && (data[0].placeVisit || data[0].activitySegment)) return true;
+  return false;
+}
+
+// Normalize Maps Timeline data (any format) into standard activity objects
+function normalizeTimelineToActivities(data) {
   let segments = [];
 
   if (data.timelineObjects) {
-    // Older format: array of { placeVisit } or { activitySegment }
     segments = data.timelineObjects;
   } else if (data.semanticSegments) {
-    // Newer format
     segments = data.semanticSegments;
   } else if (Array.isArray(data)) {
     segments = data;
   }
 
-  // Convert timeline entries to activity format for graph ingest
   const activities = [];
 
   for (const entry of segments) {
@@ -381,10 +407,16 @@ async function processTimelineData(data, key, env) {
 
     if (visit) {
       const location = visit.location || {};
+      const startTs = visit.duration?.startTimestamp;
+      const startMs = visit.duration?.startTimestampMs;
+      let time = null;
+      if (startTs && typeof startTs === 'string') {
+        time = startTs;
+      } else if (startMs) {
+        time = new Date(parseInt(startMs)).toISOString();
+      }
       activities.push({
-        time: visit.duration?.startTimestamp || visit.duration?.startTimestampMs
-          ? new Date(parseInt(visit.duration.startTimestampMs || 0)).toISOString()
-          : null,
+        time,
         title: `Visited ${location.name || location.address || 'unknown location'}`,
         products: ['Maps'],
         description: [
@@ -403,7 +435,6 @@ async function processTimelineData(data, key, env) {
     if (segment) {
       const activityType = segment.activityType || segment.activities?.[0]?.activityType || 'UNKNOWN';
       const start = segment.duration?.startTimestamp || segment.duration?.startTimestampMs;
-      const end = segment.duration?.endTimestamp || segment.duration?.endTimestampMs;
       activities.push({
         time: start ? (typeof start === 'string' ? start : new Date(parseInt(start)).toISOString()) : null,
         title: `${activityType.replace(/_/g, ' ').toLowerCase()}`,
@@ -413,16 +444,37 @@ async function processTimelineData(data, key, env) {
     }
   }
 
-  const timestamped = activities.filter(a => a.time);
+  return { activities: activities.filter(a => a.time), rawEntries: segments.length };
+}
+
+// Normalize any parsed activity data — handles both standard and timeline formats
+function normalizeActivities(parsed, path) {
+  if (isTimelineData(parsed)) {
+    const { activities } = normalizeTimelineToActivities(parsed);
+    return { activities, resource: 'maps.timeline' };
+  }
+
+  let activities = Array.isArray(parsed) ? parsed : [parsed];
+  if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
+    const inner = Object.values(activities[0]);
+    if (Array.isArray(inner[0])) activities = inner[0];
+  }
+
+  return { activities, resource: resourceFromPath(path) };
+}
+
+async function processTimelineData(data, key, env) {
+  const { activities: timestamped, rawEntries } = normalizeTimelineToActivities(data);
+
   if (timestamped.length === 0) {
-    return jsonResponse({ success: true, message: 'No timestamped timeline entries found', rawEntries: segments.length });
+    return jsonResponse({ success: true, message: 'No timestamped timeline entries found', rawEntries });
   }
 
   const result = await ingestActivitiesToGraph(timestamped, 'maps.timeline', env);
 
   await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
     processedAt: new Date().toISOString(),
-    rawEntries: segments.length,
+    rawEntries,
     activitiesCreated: timestamped.length,
     result,
   }));
@@ -447,15 +499,15 @@ async function streamProcessZip(r2Object, key, env) {
     const uz = new Unzip();
     uz.register(UnzipInflate);
 
-    const pendingFiles = [];
+    // Queue of completed file buffers to process — allows releasing memory per file
+    const readyQueue = [];
+    let streamDone = false;
 
     uz.onfile = (file) => {
       filesFound++;
       const path = file.name;
 
-      // Skip non-activity files (photos, videos, mbox, etc.)
       if (!isActivityFile(path)) {
-        // Must still drain the file to keep the stream flowing
         file.ondata = () => {};
         file.start();
         return;
@@ -466,24 +518,21 @@ async function streamProcessZip(r2Object, key, env) {
 
       file.ondata = (err, data, final) => {
         if (err) {
-          results.push({ path, error: err.message || 'decompression error' });
+          results.push({ path, error: 'decompression error' });
           return;
         }
         if (data) chunks.push(data);
         if (final) {
-          // Combine chunks into full file
           const totalLen = chunks.reduce((s, c) => s + c.length, 0);
           const full = new Uint8Array(totalLen);
           let offset = 0;
           for (const chunk of chunks) { full.set(chunk, offset); offset += chunk.length; }
-
-          pendingFiles.push({ path, data: full });
+          readyQueue.push({ path, data: full });
         }
       };
       file.start();
     };
 
-    // Read the R2 stream in chunks and feed to Unzip
     const reader = r2Object.body.getReader();
     try {
       while (true) {
@@ -495,22 +544,17 @@ async function streamProcessZip(r2Object, key, env) {
         uz.push(value);
       }
     } catch (e) {
-      resolve(jsonResponse({ error: 'Stream read failed: ' + e.message }, 500));
+      console.error('Stream read failed:', e);
+      resolve(jsonResponse({ error: 'Archive stream read failed' }, 500));
       return;
     }
 
-    // Now process all collected activity files
-    for (const { path, data } of pendingFiles) {
-      const resource = resourceFromPath(path);
+    // Process each file and release its buffer immediately
+    for (const { path, data } of readyQueue) {
       try {
         const text = new TextDecoder().decode(data);
-        let parsed = JSON.parse(text);
-        let activities = Array.isArray(parsed) ? parsed : [parsed];
-
-        if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
-          const inner = Object.values(activities[0]);
-          if (Array.isArray(inner[0])) activities = inner[0];
-        }
+        const parsed = JSON.parse(text);
+        const { activities, resource } = normalizeActivities(parsed, path);
 
         if (activities.length === 0) continue;
 
@@ -524,9 +568,11 @@ async function streamProcessZip(r2Object, key, env) {
           topicsLinked: result.topicsLinked,
         });
       } catch (e) {
-        results.push({ path, resource, error: e.message });
+        console.error(`Failed to process ${path}:`, e);
+        results.push({ path, resource: resourceFromPath(path), error: 'Failed to parse or ingest file' });
       }
     }
+    readyQueue.length = 0; // Release references
 
     await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
       processedAt: new Date().toISOString(),
@@ -553,7 +599,8 @@ async function processSmallZip(zipData, key, env) {
   try {
     entries = unzipSync(zipData);
   } catch (e) {
-    return jsonResponse({ error: 'ZIP decompression failed', details: e.message }, 422);
+    console.error('ZIP decompression failed:', e);
+    return jsonResponse({ error: 'ZIP decompression failed — archive may be corrupted or invalid' }, 422);
   }
 
   const activityFiles = Object.keys(entries).filter(isActivityFile);
@@ -561,16 +608,10 @@ async function processSmallZip(zipData, key, env) {
   let totalActivities = 0;
 
   for (const path of activityFiles) {
-    const resource = resourceFromPath(path);
     try {
       const text = new TextDecoder().decode(entries[path]);
-      let data = JSON.parse(text);
-      let activities = Array.isArray(data) ? data : [data];
-
-      if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
-        const inner = Object.values(activities[0]);
-        if (Array.isArray(inner[0])) activities = inner[0];
-      }
+      const parsed = JSON.parse(text);
+      const { activities, resource } = normalizeActivities(parsed, path);
 
       if (activities.length === 0) continue;
 
@@ -584,7 +625,8 @@ async function processSmallZip(zipData, key, env) {
         topicsLinked: result.topicsLinked,
       });
     } catch (e) {
-      results.push({ path, resource, error: e.message });
+      console.error(`Failed to process ${path}:`, e);
+      results.push({ path, resource: resourceFromPath(path), error: 'Failed to parse or ingest file' });
     }
   }
 
