@@ -676,6 +676,8 @@ async function ingestMusic(url, env) {
 }
 
 async function ingestStatus(url, env) {
+  const token = url.searchParams.get('token') || url.searchParams.get('ptoken');
+  if (!token) return jsonResponse({ error: 'Authentication required' }, 401);
   try {
     const result = await neo4jQuery(env,
       `MATCH (s:Song) WITH count(s) as songCount
@@ -759,21 +761,32 @@ function recencyColor(dateStr) {
   } catch { return '#333'; }
 }
 
+function escapeHtml(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function renderExplorer(cards, ptoken) {
   const cardHtml = cards.map(card => {
     if (card.error && !card.service) return '';
     const color = recencyColor(card.latest);
-    const recency = formatDate(card.latest);
-    return `<div class="card" data-service="${card.service}">
+    const recency = escapeHtml(formatDate(card.latest));
+    const serviceName = escapeHtml(card.service);
+    const safeTotal = escapeHtml(String(card.total || ''));
+    const safeDetail = card.detail ? escapeHtml(card.detail) : '';
+    const safeError = escapeHtml(typeof card.error === 'string' ? card.error : 'unavailable');
+    const safeDataService = serviceName.replace(/[^a-zA-Z0-9_ -]/g, '');
+    return `<div class="card" data-service="${safeDataService}">
       <div class="card-header">
         <span class="icon">${card.icon || '\u{1F4CA}'}</span>
-        <span class="service-name">${card.service}</span>
+        <span class="service-name">${serviceName}</span>
         <span class="recency-dot" style="background:${color}" title="${recency}"></span>
       </div>
       ${card.error
-        ? `<div class="volume error">error: ${typeof card.error === 'string' ? card.error : 'unavailable'}</div>`
-        : `<div class="volume">${card.total}</div>
-           ${card.detail ? `<div class="detail">${card.detail}</div>` : ''}
+        ? `<div class="volume error">error: ${safeError}</div>`
+        : `<div class="volume">${safeTotal}</div>
+           ${safeDetail ? `<div class="detail">${safeDetail}</div>` : ''}
            <div class="recency">last activity: <strong>${recency}</strong></div>
            ${card.ingest ? `<button class="ingest-btn" onclick="ingest('${card.ingest}', this)">connect to graph</button>` : ''}`}
       <div class="card-status"></div>
@@ -878,7 +891,7 @@ async function checkGraphStatus() {
   try {
     const [g, s] = await Promise.all([
       fetch('/graph/stats?token=' + (token || ptoken)).then(r => r.json()).catch(() => null),
-      fetch('/ingest/status').then(r => r.json()).catch(() => null),
+      fetch('/ingest/status?token=' + (token || ptoken)).then(r => r.json()).catch(() => null),
     ]);
     const el = document.getElementById('graphStatus');
     const text = document.getElementById('graphStatusText');
