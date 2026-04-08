@@ -270,7 +270,7 @@ export async function stageTakeout(url, env) {
   }
 }
 
-// ---- PROCESS: Extract activity JSONs from a staged ZIP and ingest to graph ----
+// ---- PROCESS: Extract and ingest from a staged file (ZIP or JSON) ----
 
 export async function processTakeout(url, env) {
   const token = url.searchParams.get('token');
@@ -279,84 +279,217 @@ export async function processTakeout(url, env) {
   if (!key) return jsonResponse({ error: 'No key' }, 400);
 
   try {
-    // Read the ZIP from R2
     const obj = await env.ARCHIVES.get(key);
     if (!obj) return jsonResponse({ error: 'Archive not found in storage' }, 404);
 
     const sizeBytes = obj.size;
-    const MAX_PROCESS_SIZE = 512 * 1024 * 1024; // 512MB limit for in-memory processing
+    const MAX_PROCESS_SIZE = 512 * 1024 * 1024;
     if (sizeBytes > MAX_PROCESS_SIZE) {
       return jsonResponse({
-        error: `Archive too large for single-pass processing: ${(sizeBytes / (1024 * 1024)).toFixed(0)}MB`,
-        hint: 'Re-export with smaller file size setting (1GB or 2GB)',
+        error: `File too large for processing: ${(sizeBytes / (1024 * 1024)).toFixed(0)}MB`,
+        hint: 'Re-export with smaller file size setting',
       }, 413);
     }
 
-    // Read entire ZIP into memory and decompress
     const arrayBuf = await obj.arrayBuffer();
-    const zipData = new Uint8Array(arrayBuf);
+    const bytes = new Uint8Array(arrayBuf);
 
-    let entries;
-    try {
-      entries = unzipSync(zipData);
-    } catch (e) {
-      return jsonResponse({ error: 'ZIP decompression failed', details: e.message }, 422);
+    // Detect file type: ZIP starts with PK (0x50 0x4B), JSON starts with [ or {
+    const isZip = bytes[0] === 0x50 && bytes[1] === 0x4B;
+    const firstChar = String.fromCharCode(bytes[0]);
+    const isJson = firstChar === '[' || firstChar === '{';
+
+    if (isZip) {
+      return processZipArchive(bytes, key, env);
+    } else if (isJson) {
+      const resource = resourceFromPath(key);
+      return processJsonFile(arrayBuf, key, resource, env);
+    } else {
+      return jsonResponse({
+        error: 'Unknown file format',
+        magic: Array.from(bytes.slice(0, 4)).map(b => b.toString(16)).join(' '),
+      }, 422);
     }
-
-    // Filter to activity files only
-    const activityFiles = Object.keys(entries).filter(isActivityFile);
-
-    const results = [];
-    let totalActivities = 0;
-
-    for (const path of activityFiles) {
-      const resource = resourceFromPath(path);
-      try {
-        const text = new TextDecoder().decode(entries[path]);
-        let data = JSON.parse(text);
-        let activities = Array.isArray(data) ? data : [data];
-
-        // Flatten nested structures (same as portability pipeline)
-        if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
-          const inner = Object.values(activities[0]);
-          if (Array.isArray(inner[0])) activities = inner[0];
-        }
-
-        if (activities.length === 0) continue;
-
-        const result = await ingestActivitiesToGraph(activities, resource, env);
-        totalActivities += activities.length;
-        results.push({
-          path,
-          resource,
-          activities: activities.length,
-          nodesCreated: result.nodesCreated,
-          chainsCreated: result.chainsCreated,
-          topicsLinked: result.topicsLinked,
-        });
-      } catch (e) {
-        results.push({ path, resource, error: e.message });
-      }
-    }
-
-    // Store processing metadata in R2
-    await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
-      processedAt: new Date().toISOString(),
-      filesFound: Object.keys(entries).length,
-      activityFiles: activityFiles.length,
-      totalActivities,
-      results,
-    }));
-
-    return jsonResponse({
-      success: true,
-      filesInArchive: Object.keys(entries).length,
-      activityFilesFound: activityFiles.length,
-      totalActivities,
-      results,
-    });
   } catch (e) {
     console.error('Process takeout failed:', e.message);
-    return jsonResponse({ error: 'Archive processing failed' }, 500);
+    return jsonResponse({ error: 'Processing failed' }, 500);
   }
+}
+
+async function processJsonFile(arrayBuf, key, resource, env) {
+  const text = new TextDecoder().decode(arrayBuf);
+  let data;
+  try { data = JSON.parse(text); } catch (e) {
+    return jsonResponse({ error: 'JSON parse failed', details: e.message }, 422);
+  }
+
+  // Handle Maps Timeline format (has timelineObjects or semanticSegments)
+  if (data.timelineObjects || data.semanticSegments || (Array.isArray(data) && data[0]?.placeVisit)) {
+    return processTimelineData(data, key, env);
+  }
+
+  // Standard activity format
+  let activities = Array.isArray(data) ? data : [data];
+
+  // Flatten nested structures
+  if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
+    const inner = Object.values(activities[0]);
+    if (Array.isArray(inner[0])) activities = inner[0];
+  }
+
+  if (activities.length === 0) {
+    return jsonResponse({ success: true, message: 'No activities found', key });
+  }
+
+  const result = await ingestActivitiesToGraph(activities, resource, env);
+
+  await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
+    processedAt: new Date().toISOString(),
+    totalActivities: activities.length,
+    result,
+  }));
+
+  return jsonResponse({
+    success: true,
+    format: 'json',
+    resource,
+    activitiesProcessed: activities.length,
+    graphResult: result,
+  });
+}
+
+async function processTimelineData(data, key, env) {
+  // Maps Timeline can come in different formats depending on export date
+  let segments = [];
+
+  if (data.timelineObjects) {
+    // Older format: array of { placeVisit } or { activitySegment }
+    segments = data.timelineObjects;
+  } else if (data.semanticSegments) {
+    // Newer format
+    segments = data.semanticSegments;
+  } else if (Array.isArray(data)) {
+    segments = data;
+  }
+
+  // Convert timeline entries to activity format for graph ingest
+  const activities = [];
+
+  for (const entry of segments) {
+    const visit = entry.placeVisit;
+    const segment = entry.activitySegment;
+
+    if (visit) {
+      const location = visit.location || {};
+      activities.push({
+        time: visit.duration?.startTimestamp || visit.duration?.startTimestampMs
+          ? new Date(parseInt(visit.duration.startTimestampMs || 0)).toISOString()
+          : null,
+        title: `Visited ${location.name || location.address || 'unknown location'}`,
+        products: ['Maps'],
+        description: [
+          location.address,
+          location.semanticType,
+          visit.placeConfidence,
+        ].filter(Boolean).join(' · '),
+        locationInfos: [{
+          name: location.name,
+          lat: location.latitudeE7 ? location.latitudeE7 / 1e7 : null,
+          lng: location.longitudeE7 ? location.longitudeE7 / 1e7 : null,
+        }],
+      });
+    }
+
+    if (segment) {
+      const activityType = segment.activityType || segment.activities?.[0]?.activityType || 'UNKNOWN';
+      const start = segment.duration?.startTimestamp || segment.duration?.startTimestampMs;
+      const end = segment.duration?.endTimestamp || segment.duration?.endTimestampMs;
+      activities.push({
+        time: start ? (typeof start === 'string' ? start : new Date(parseInt(start)).toISOString()) : null,
+        title: `${activityType.replace(/_/g, ' ').toLowerCase()}`,
+        products: ['Maps'],
+        description: segment.distance ? `${(segment.distance / 1000).toFixed(1)} km` : null,
+      });
+    }
+  }
+
+  const timestamped = activities.filter(a => a.time);
+  if (timestamped.length === 0) {
+    return jsonResponse({ success: true, message: 'No timestamped timeline entries found', rawEntries: segments.length });
+  }
+
+  const result = await ingestActivitiesToGraph(timestamped, 'maps.timeline', env);
+
+  await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
+    processedAt: new Date().toISOString(),
+    rawEntries: segments.length,
+    activitiesCreated: timestamped.length,
+    result,
+  }));
+
+  return jsonResponse({
+    success: true,
+    format: 'timeline',
+    rawEntries: segments.length,
+    activitiesProcessed: timestamped.length,
+    graphResult: result,
+  });
+}
+
+async function processZipArchive(zipData, key, env) {
+  let entries;
+  try {
+    entries = unzipSync(zipData);
+  } catch (e) {
+    return jsonResponse({ error: 'ZIP decompression failed', details: e.message }, 422);
+  }
+
+  const activityFiles = Object.keys(entries).filter(isActivityFile);
+  const results = [];
+  let totalActivities = 0;
+
+  for (const path of activityFiles) {
+    const resource = resourceFromPath(path);
+    try {
+      const text = new TextDecoder().decode(entries[path]);
+      let data = JSON.parse(text);
+      let activities = Array.isArray(data) ? data : [data];
+
+      if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
+        const inner = Object.values(activities[0]);
+        if (Array.isArray(inner[0])) activities = inner[0];
+      }
+
+      if (activities.length === 0) continue;
+
+      const result = await ingestActivitiesToGraph(activities, resource, env);
+      totalActivities += activities.length;
+      results.push({
+        path, resource,
+        activities: activities.length,
+        nodesCreated: result.nodesCreated,
+        chainsCreated: result.chainsCreated,
+        topicsLinked: result.topicsLinked,
+      });
+    } catch (e) {
+      results.push({ path, resource, error: e.message });
+    }
+  }
+
+  await env.ARCHIVES.put(`${key}.processed.json`, JSON.stringify({
+    processedAt: new Date().toISOString(),
+    filesFound: Object.keys(entries).length,
+    activityFiles: activityFiles.length,
+    totalActivities,
+    results,
+  }));
+
+  return jsonResponse({
+    success: true,
+    format: 'zip',
+    filesInArchive: Object.keys(entries).length,
+    activityFilesFound: activityFiles.length,
+    totalActivities,
+    results,
+  });
 }
