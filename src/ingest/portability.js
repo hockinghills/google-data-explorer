@@ -69,6 +69,7 @@ export async function archiveStatus(url, env) {
 
   let jobs;
   try { jobs = JSON.parse(jobsParam); } catch { return jsonResponse({ error: 'Invalid jobs JSON' }, 400); }
+  if (!Array.isArray(jobs)) return jsonResponse({ error: 'Jobs must be an array' }, 400);
 
   const statuses = [];
   for (const job of jobs) {
@@ -94,6 +95,7 @@ export async function processArchives(url, env) {
   const resource = url.searchParams.get('resource');
   const archiveUrl = url.searchParams.get('url');
   if (!token) return jsonResponse({ error: 'No portability token' }, 401);
+  if (!resource) return jsonResponse({ error: 'No resource specified' }, 400);
   if (!archiveUrl) return jsonResponse({ error: 'No archive URL' }, 400);
 
   // Validate archive URL is from Google storage (prevent SSRF/open proxy)
@@ -163,7 +165,7 @@ export async function processArchives(url, env) {
     }
 
     // Flatten nested structures
-    if (activities.length === 1 && !activities[0].time && typeof activities[0] === 'object') {
+    if (activities.length === 1 && activities[0] && !activities[0].time && typeof activities[0] === 'object') {
       const inner = Object.values(activities[0]);
       if (Array.isArray(inner[0])) activities = inner[0];
     }
@@ -171,6 +173,6 @@ export async function processArchives(url, env) {
     const result = await ingestActivitiesToGraph(activities, resource, env);
     return jsonResponse({ success: true, resource, activitiesProcessed: activities.length, graphResult: result });
   } catch (e) {
-    return jsonResponse({ error: e.message, stack: e.stack }, 500);
+    return jsonResponse({ error: e.message }, 500);
   }
 }

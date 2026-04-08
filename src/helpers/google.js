@@ -4,6 +4,9 @@ export async function fetchGoogle(endpoint, token, params = {}) {
   const res = await fetch(url.toString(), {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) return { error: res.status, message: await res.text() };
+  if (!res.ok) {
+    const message = await res.text();
+    throw new Error(`Google API ${res.status}: ${message.slice(0, 200)}`);
+  }
   return res.json();
 }

@@ -30,5 +30,5 @@ export async function ingestMusic(url, env) {
     }
     return jsonResponse({ success: true, totalSongs: allSongs.length, nodesCreated: created,
       sampleArtists: [...new Set(allSongs.map(s => s.channel))].slice(0, 20) });
-  } catch (e) { return jsonResponse({ error: e.message, stack: e.stack }, 500); }
+  } catch (e) { return jsonResponse({ error: e.message }, 500); }
 }

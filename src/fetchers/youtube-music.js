@@ -8,7 +8,8 @@ export async function getYouTubeMusic(token) {
       { part: 'snippet,contentDetails', playlistId: 'LL', maxResults: '10' });
     const likedTotal = likedVideos.pageInfo?.totalResults || 0;
     const recentLiked = (likedVideos.items || []).slice(0, 5).map(item => ({
-      title: item.snippet?.title, channel: item.snippet?.videoOwnerChannelTitle }));
+      title: item.snippet?.title, channel: item.snippet?.videoOwnerChannelTitle,
+      addedAt: item.snippet?.publishedAt }));
     const latest = recentLiked[0]?.addedAt || playlists.items?.[0]?.snippet?.publishedAt || null;
     // Count unique artists
     const artists = [...new Set(recentLiked.map(r => r.channel).filter(Boolean))];

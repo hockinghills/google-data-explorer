@@ -15,16 +15,22 @@ export async function getCalendar(token) {
     const hourBuckets = { morning: 0, afternoon: 0, evening: 0, night: 0 };
     const dayBuckets = {};
     for (const evt of events) {
-      const start = evt.start?.dateTime || evt.start?.date;
+      const dateTime = evt.start?.dateTime;
+      const dateOnly = evt.start?.date;
+      const start = dateTime || dateOnly;
       if (!start) continue;
+      // Day-of-week: count all events
       const d = new Date(start);
-      const h = d.getHours();
-      if (h >= 6 && h < 12) hourBuckets.morning++;
-      else if (h >= 12 && h < 17) hourBuckets.afternoon++;
-      else if (h >= 17 && h < 22) hourBuckets.evening++;
-      else hourBuckets.night++;
       const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
       dayBuckets[day] = (dayBuckets[day] || 0) + 1;
+      // Hour buckets: only timed events (all-day events have no meaningful hour)
+      if (dateTime) {
+        const h = d.getHours();
+        if (h >= 6 && h < 12) hourBuckets.morning++;
+        else if (h >= 12 && h < 17) hourBuckets.afternoon++;
+        else if (h >= 17 && h < 22) hourBuckets.evening++;
+        else hourBuckets.night++;
+      }
     }
     const busiestTime = Object.entries(hourBuckets).sort((a, b) => b[1] - a[1])[0];
     const busiestDay = Object.entries(dayBuckets).sort((a, b) => b[1] - a[1])[0];

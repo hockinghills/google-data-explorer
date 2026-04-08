@@ -16,6 +16,7 @@ export async function getFit(token) {
           { dataTypeName: 'com.google.calories.expended' }],
         bucketByTime: { durationMillis: 3600000 }, startTimeMillis: dayAgo, endTimeMillis: now }),
     });
+    if (!aggRes.ok) throw new Error(`Fitness aggregate API ${aggRes.status}`);
     const aggData = await aggRes.json();
     let latestTs = null, hr = 0, steps = 0, cal = 0;
     for (const b of (aggData.bucket || []).reverse()) {
