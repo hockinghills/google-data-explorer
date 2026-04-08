@@ -36,7 +36,15 @@ export async function handleCallback(url, env, flow) {
     }),
   });
 
-  const tokens = await tokenRes.json();
+  if (!tokenRes.ok) {
+    const body = await tokenRes.text();
+    return new Response(`Token exchange failed (${tokenRes.status}): ${body.slice(0, 200)}`, { status: 400 });
+  }
+
+  let tokens;
+  try { tokens = await tokenRes.json(); } catch {
+    return new Response('Token response was not valid JSON', { status: 502 });
+  }
   if (!tokens.access_token) {
     return new Response(`Token error: ${JSON.stringify(tokens)}`, { status: 400 });
   }

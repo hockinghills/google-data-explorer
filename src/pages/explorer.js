@@ -265,9 +265,9 @@ async function pollSingleJob(job, resource, btn, status) {
         btn.classList.remove('running'); btn.classList.add('error');
         btn.textContent = 'ingest failed';
       }
-    } else if (s.state === 'FAILED') {
+    } else if (s.state === 'FAILED' || s.state === 'ERROR') {
       btn.classList.remove('running'); btn.classList.add('error');
-      btn.textContent = 'failed'; status.textContent = s.error || '';
+      btn.textContent = 'failed'; status.textContent = s.error || s.state.toLowerCase();
     } else {
       status.textContent = s.state.toLowerCase() + '... checking in 15s';
       setTimeout(() => pollSingleJob(job, resource, btn, status), 15000);

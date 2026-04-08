@@ -16,7 +16,8 @@ export async function graphStats(url, env) {
     const v = result.data?.values?.[0] || [0, 0, 0, 0, 0];
     return jsonResponse({ activities: v[0], topics: v[1], products: v[2], chains: v[3], aboutLinks: v[4] });
   } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+    console.error('Graph stats failed:', e.message);
+    return jsonResponse({ error: 'Graph query failed' }, 500);
   }
 }
 
@@ -30,5 +31,8 @@ export async function ingestStatus(url, env) {
        OPTIONAL MATCH ()-[r:BY]->() RETURN songCount, artistCount, count(r) as relationships`);
     const v = result.data?.values?.[0] || [0, 0, 0];
     return jsonResponse({ songs: v[0], artists: v[1], relationships: v[2] });
-  } catch (e) { return jsonResponse({ error: e.message }, 500); }
+  } catch (e) {
+    console.error('Ingest status failed:', e.message);
+    return jsonResponse({ error: 'Graph query failed' }, 500);
+  }
 }

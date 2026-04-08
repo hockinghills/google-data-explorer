@@ -23,6 +23,7 @@ export async function ensureGraphSchema(url, env) {
     );
     return jsonResponse({ success: true });
   } catch (e) {
-    return jsonResponse({ error: e.message }, 500);
+    console.error('Schema setup failed:', e.message);
+    return jsonResponse({ error: 'Schema setup failed' }, 500);
   }
 }

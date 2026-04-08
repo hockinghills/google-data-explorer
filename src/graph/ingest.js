@@ -61,7 +61,7 @@ export async function ingestActivitiesToGraph(activities, resource, env) {
      UNWIND range(0, size(acts) - 2) AS i
      WITH acts[i] AS a1, acts[i + 1] AS a2
      MERGE (a1)-[r:THEN]->(a2)
-     SET r.gap_ms = duration.between(a1.time, a2.time).milliseconds
+     SET r.gap_ms = a2.time.epochMillis - a1.time.epochMillis
      RETURN count(r) AS chains`,
     { resource }
   );
