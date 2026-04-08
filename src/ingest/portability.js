@@ -78,6 +78,10 @@ export async function archiveStatus(url, env) {
         `https://dataportability.googleapis.com/v1/archiveJobs/${job.jobId}/portabilityArchiveState`,
         { headers: { 'Authorization': `Bearer ${token}` } }
       );
+      if (!res.ok) {
+        statuses.push({ resource: job.resource, jobId: job.jobId, state: 'FAILED', error: `Status check failed: ${res.status}` });
+        continue;
+      }
       const data = await res.json();
       statuses.push({ resource: job.resource, jobId: job.jobId, state: data.state || 'UNKNOWN', urls: data.urls || [] });
     } catch (e) {
