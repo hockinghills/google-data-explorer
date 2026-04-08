@@ -42,46 +42,170 @@ function resourceFromPath(path) {
   return 'unknown';
 }
 
-// ---- DISCOVER: Find Takeout archives in user's Drive ----
+// Data categories for user-facing selection
+const CATEGORIES = {
+  activity_youtube:   { label: 'YouTube Activity', icon: '🎬', graphReady: true },
+  activity_search:    { label: 'Search Activity', icon: '🔍', graphReady: true },
+  activity_maps:      { label: 'Maps Activity', icon: '📍', graphReady: true },
+  activity_chrome:    { label: 'Chrome Activity', icon: '🌐', graphReady: true },
+  activity_gmail:     { label: 'Gmail Activity', icon: '📧', graphReady: true },
+  activity_play:      { label: 'Play Store Activity', icon: '📱', graphReady: true },
+  activity_shopping:  { label: 'Shopping Activity', icon: '🛒', graphReady: true },
+  activity_other:     { label: 'Other Activity', icon: '📊', graphReady: true },
+  chrome_history:     { label: 'Chrome History', icon: '🌐', graphReady: true },
+  youtube_history:    { label: 'YouTube Watch History', icon: '▶️', graphReady: true },
+  youtube_subs:       { label: 'YouTube Subscriptions', icon: '📺', graphReady: true },
+  fitness:            { label: 'Google Fit', icon: '💪', graphReady: true },
+  maps_timeline:      { label: 'Maps Timeline', icon: '🗺️', graphReady: true },
+  contacts:           { label: 'Contacts', icon: '👥', graphReady: false },
+  mail:               { label: 'Gmail Messages', icon: '📧', graphReady: false },
+  drive_files:        { label: 'Drive Files', icon: '📁', graphReady: false },
+  photos:             { label: 'Photos & Videos', icon: '📷', graphReady: false },
+  calendar:           { label: 'Calendar', icon: '📅', graphReady: false },
+  tasks:              { label: 'Tasks', icon: '✅', graphReady: false },
+  other:              { label: 'Other Data', icon: '📦', graphReady: false },
+};
+
+function categorizeFile(name, mimeType) {
+  const n = name.toLowerCase();
+  const m = (mimeType || '').toLowerCase();
+
+  // Activity JSONs (graph-ready)
+  if (n.includes('my activity') && n.includes('youtube')) return 'activity_youtube';
+  if (n.includes('my activity') && n.includes('search')) return 'activity_search';
+  if (n.includes('my activity') && n.includes('maps')) return 'activity_maps';
+  if (n.includes('my activity') && n.includes('chrome')) return 'activity_chrome';
+  if (n.includes('my activity') && n.includes('gmail')) return 'activity_gmail';
+  if (n.includes('my activity') && n.includes('play')) return 'activity_play';
+  if (n.includes('my activity') && n.includes('shopping')) return 'activity_shopping';
+  if (n.includes('my activity')) return 'activity_other';
+  if (n.includes('browsinghistory')) return 'chrome_history';
+  if (n.includes('watch-history') || n.includes('watch history')) return 'youtube_history';
+  if (n.includes('subscription')) return 'youtube_subs';
+  if (n.includes('fit') || n.includes('fitness')) return 'fitness';
+  if (n.includes('timeline') || n.includes('location history') || n.includes('semantic')) return 'maps_timeline';
+
+  // Non-graph-ready (user can opt in later)
+  if (n.includes('contact') || n.includes('vcf') || n.includes('vcard')) return 'contacts';
+  if (n.includes('mail') && (n.includes('mbox') || m.includes('mbox'))) return 'mail';
+  if (m.includes('image') || m.includes('video') || n.includes('photo') || /\.(jpg|jpeg|png|gif|mp4|mov|heic)$/i.test(n)) return 'photos';
+  if (n.includes('calendar') || n.includes('ical') || n.includes('.ics')) return 'calendar';
+  if (n.includes('task')) return 'tasks';
+  if (n.includes('drive')) return 'drive_files';
+
+  // ZIP archives get their own handling
+  if (m.includes('zip') || /\.zip$/i.test(n) || /\.tgz$/i.test(n)) return 'archive';
+
+  return 'other';
+}
+
+// ---- DISCOVER: Catalog everything in user's Takeout folder ----
 
 export async function discoverTakeout(url, env) {
   const token = url.searchParams.get('token');
   if (!token) return jsonResponse({ error: 'No token' }, 401);
 
   try {
-    // Search for Takeout ZIP files in Drive
-    const zipResults = await fetchGoogle(
-      'https://www.googleapis.com/drive/v3/files', token,
-      { q: TAKEOUT_ZIP_QUERY, pageSize: '50', fields: 'files(id,name,size,createdTime,modifiedTime,mimeType)', orderBy: 'createdTime desc' }
-    );
-
-    // Also check for Takeout folders (in case they extracted)
+    // Find Takeout folders
     const folderResults = await fetchGoogle(
       'https://www.googleapis.com/drive/v3/files', token,
       { q: TAKEOUT_FOLDER_QUERY, pageSize: '10', fields: 'files(id,name,createdTime)', orderBy: 'createdTime desc' }
     );
+    const folders = folderResults.files || [];
 
-    const archives = (zipResults.files || []).map(f => ({
-      id: f.id,
-      name: f.name,
-      sizeBytes: parseInt(f.size || '0'),
-      sizeMB: (parseInt(f.size || '0') / (1024 * 1024)).toFixed(1),
-      created: f.createdTime,
-      type: 'zip',
-    }));
+    // Also find top-level Takeout ZIPs (not in a folder)
+    const topZips = await fetchGoogle(
+      'https://www.googleapis.com/drive/v3/files', token,
+      { q: TAKEOUT_ZIP_QUERY, pageSize: '50', fields: 'files(id,name,size,createdTime,mimeType)', orderBy: 'createdTime desc' }
+    );
 
-    const folders = (folderResults.files || []).map(f => ({
-      id: f.id,
-      name: f.name,
-      created: f.createdTime,
-      type: 'folder',
-    }));
+    // Collect all files from Takeout folders
+    let allFiles = [];
 
-    // Check what's already in R2
-    let stored = [];
+    for (const folder of folders) {
+      let pageToken = null;
+      do {
+        const params = {
+          q: `'${folder.id}' in parents and trashed = false`,
+          pageSize: '100',
+          fields: 'files(id,name,size,createdTime,mimeType),nextPageToken',
+          orderBy: 'name',
+        };
+        if (pageToken) params.pageToken = pageToken;
+
+        const page = await fetchGoogle(
+          'https://www.googleapis.com/drive/v3/files', token, params
+        );
+        const files = (page.files || []).map(f => ({
+          ...f,
+          folder: folder.name,
+          folderId: folder.id,
+        }));
+        allFiles = allFiles.concat(files);
+        pageToken = page.nextPageToken || null;
+      } while (pageToken);
+    }
+
+    // Add top-level ZIPs
+    for (const zip of (topZips.files || [])) {
+      if (!allFiles.find(f => f.id === zip.id)) {
+        allFiles.push({ ...zip, folder: 'root' });
+      }
+    }
+
+    // Categorize everything
+    const catalog = {};
+    for (const [key, meta] of Object.entries(CATEGORIES)) {
+      catalog[key] = { ...meta, files: [], totalSizeMB: 0, fileCount: 0 };
+    }
+    // Add archive category
+    catalog.archive = { label: 'ZIP Archives', icon: '📦', graphReady: false, files: [], totalSizeMB: 0, fileCount: 0 };
+
+    for (const f of allFiles) {
+      const cat = categorizeFile(f.name, f.mimeType);
+      const sizeBytes = parseInt(f.size || '0');
+      const entry = {
+        id: f.id,
+        name: f.name,
+        sizeMB: (sizeBytes / (1024 * 1024)).toFixed(1),
+        created: f.createdTime,
+        folder: f.folder,
+      };
+      if (catalog[cat]) {
+        catalog[cat].files.push(entry);
+        catalog[cat].totalSizeMB += sizeBytes / (1024 * 1024);
+        catalog[cat].fileCount++;
+      } else {
+        catalog.other.files.push(entry);
+        catalog.other.totalSizeMB += sizeBytes / (1024 * 1024);
+        catalog.other.fileCount++;
+      }
+    }
+
+    // Round totals
+    for (const cat of Object.values(catalog)) {
+      cat.totalSizeMB = parseFloat(cat.totalSizeMB.toFixed(1));
+    }
+
+    // Build summary — only include categories that have files
+    const summary = {};
+    for (const [key, cat] of Object.entries(catalog)) {
+      if (cat.fileCount > 0) {
+        summary[key] = {
+          label: cat.label,
+          icon: cat.icon,
+          graphReady: cat.graphReady,
+          fileCount: cat.fileCount,
+          totalSizeMB: cat.totalSizeMB,
+        };
+      }
+    }
+
+    // Check R2 for already-staged files
+    let staged = [];
     try {
       const list = await env.ARCHIVES.list({ prefix: 'takeout/' });
-      stored = list.objects.map(o => ({
+      staged = list.objects.map(o => ({
         key: o.key,
         sizeMB: (o.size / (1024 * 1024)).toFixed(1),
         uploaded: o.uploaded,
@@ -89,11 +213,12 @@ export async function discoverTakeout(url, env) {
     } catch (e) { /* R2 not available */ }
 
     return jsonResponse({
-      archives,
-      folders,
-      stored,
-      totalArchives: archives.length,
-      totalSizeMB: archives.reduce((sum, a) => sum + parseFloat(a.sizeMB), 0).toFixed(1),
+      summary,
+      catalog,
+      totalFiles: allFiles.length,
+      totalSizeMB: parseFloat(allFiles.reduce((sum, f) => sum + parseInt(f.size || '0'), 0) / (1024 * 1024)).toFixed(1),
+      folders: folders.map(f => ({ id: f.id, name: f.name, created: f.createdTime })),
+      staged,
     });
   } catch (e) {
     return jsonResponse({ error: e.message }, 500);
