@@ -38,8 +38,14 @@ export default {
 
     // Takeout pipeline: Drive → R2 → Graph
     if (url.pathname === '/takeout/discover') return discoverTakeout(url, env);
-    if (url.pathname === '/takeout/stage') return stageTakeout(url, env);
-    if (url.pathname === '/takeout/process') return processTakeout(url, env);
+    if (url.pathname === '/takeout/stage') {
+      if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+      return stageTakeout(url, env);
+    }
+    if (url.pathname === '/takeout/process') {
+      if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+      return processTakeout(url, env);
+    }
 
     // Graph endpoints
     if (url.pathname === '/ingest/music') return ingestMusic(url, env);
