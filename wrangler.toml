@@ -2,6 +2,10 @@ name = "google-data-explorer"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+[[r2_buckets]]
+binding = "ARCHIVES"
+bucket_name = "data-explorer-archives"
+
 # Secrets already configured via Cloudflare API:
 #   GOOGLE_CLIENT_ID
 #   GOOGLE_CLIENT_SECRET

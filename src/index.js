@@ -12,6 +12,7 @@ import { loginPage } from './pages/login.js';
 import { explorerPage } from './pages/explorer.js';
 import { initiateArchives, archiveStatus, processArchives } from './ingest/portability.js';
 import { ingestMusic } from './ingest/music.js';
+import { discoverTakeout, stageTakeout, processTakeout } from './ingest/takeout.js';
 import { graphStats, ingestStatus } from './graph/stats.js';
 import { ensureGraphSchema } from './graph/schema.js';
 
@@ -34,6 +35,11 @@ export default {
     if (url.pathname === '/portability/initiate') return initiateArchives(url, env);
     if (url.pathname === '/portability/status') return archiveStatus(url, env);
     if (url.pathname === '/portability/process') return processArchives(url, env);
+
+    // Takeout pipeline: Drive → R2 → Graph
+    if (url.pathname === '/takeout/discover') return discoverTakeout(url, env);
+    if (url.pathname === '/takeout/stage') return stageTakeout(url, env);
+    if (url.pathname === '/takeout/process') return processTakeout(url, env);
 
     // Graph endpoints
     if (url.pathname === '/ingest/music') return ingestMusic(url, env);
