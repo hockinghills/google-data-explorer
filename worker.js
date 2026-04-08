@@ -167,6 +167,33 @@ async function initiateArchives(url, env) {
   const token = url.searchParams.get('ptoken');
   if (!token) return jsonResponse({ error: 'No portability token' }, 401);
 
+  // Fix: Read and persist selection order — this shapes the graph
+  const ALLOWED_CARD_IDS = ['contacts', 'calendar', 'gmail', 'youtube', 'music', 'fitness', 'tasks', 'drive'];
+  let selectionOrder = [];
+  try {
+    const orderParam = url.searchParams.get('order');
+    if (orderParam) {
+      const parsed = JSON.parse(orderParam);
+      if (Array.isArray(parsed)) {
+        selectionOrder = [...new Set(parsed.filter(id => ALLOWED_CARD_IDS.includes(id)))].slice(0, 8);
+      }
+    }
+  } catch { /* invalid JSON, ignore */ }
+
+  // Persist selection order to graph as meta node
+  if (selectionOrder.length > 0) {
+    try {
+      await neo4jQuery(env,
+        `MERGE (o:Onboarding {id: 'current'})
+         SET o.selectionOrder = $order, o.updatedAt = datetime()`,
+        { order: selectionOrder }
+      );
+    } catch (e) {
+      // Non-fatal — log but continue with archive initiation
+      console.error('Failed to persist selection order:', e.message);
+    }
+  }
+
   const jobs = [];
   const errors = [];
 
@@ -191,7 +218,7 @@ async function initiateArchives(url, env) {
     }
   }
 
-  return jsonResponse({ jobs, errors, initiated: new Date().toISOString() });
+  return jsonResponse({ jobs, errors, selectionOrder, initiated: new Date().toISOString() });
 }
 
 async function archiveStatus(url, env) {
@@ -506,32 +533,89 @@ async function neo4jQuery(env, statement, parameters = {}) {
 }
 
 // ---- LAYER 1: LIVE DATA FETCHERS ----
+// Each returns: { service, id, icon, total, latest, preview, richness }
+// richness = 0-1 score based on volume, recency, variety — helps the person see where signal lives
 
 async function getContacts(token) {
   try {
     const data = await fetchGoogle('https://people.googleapis.com/v1/people/me/connections', token,
-      { personFields: 'names,metadata', pageSize: '1', sortOrder: 'LAST_MODIFIED_DESCENDING' });
-    return { service: 'Contacts', total: data.totalPeople || data.totalItems || 0,
-      latest: data.connections?.[0]?.metadata?.sources?.[0]?.updateTime || null, icon: '\u{1F465}' };
-  } catch (e) { return { service: 'Contacts', error: e.message, icon: '\u{1F465}' }; }
+      { personFields: 'names,emailAddresses,metadata', pageSize: '10', sortOrder: 'LAST_MODIFIED_DESCENDING' });
+    const total = data.totalPeople || data.totalItems || 0;
+    const latest = data.connections?.[0]?.metadata?.sources?.[0]?.updateTime || null;
+    const recentNames = (data.connections || []).slice(0, 5)
+      .map(c => c.names?.[0]?.displayName).filter(Boolean);
+    const hasEmail = (data.connections || []).filter(c => c.emailAddresses?.length > 0).length;
+    return {
+      service: 'People', id: 'contacts', icon: '👥', total, latest,
+      preview: {
+        headline: `${total} people in your world`,
+        detail: recentNames.length > 0 ? `recently touched: ${recentNames.join(', ')}` : null,
+        stat: hasEmail > 0 ? `${hasEmail} of last 10 have email` : null,
+      },
+      richness: Math.min(1, total / 500),
+      description: 'who you know, who you actually interact with, who you\'ve forgotten about',
+    };
+  } catch (e) { return { service: 'People', id: 'contacts', error: e.message, icon: '👥' }; }
 }
 
 async function getCalendar(token) {
   try {
-    const now = new Date().toISOString();
+    const now = new Date();
     const past = new Date(Date.now() - 365 * 86400000).toISOString();
+    // Pull a sample of events to analyze time patterns
     const data = await fetchGoogle('https://www.googleapis.com/calendar/v3/calendars/primary/events', token,
-      { timeMin: past, timeMax: now, maxResults: '1', orderBy: 'updated', singleEvents: 'true' });
-    const countData = await fetchGoogle('https://www.googleapis.com/calendar/v3/calendars/primary/events', token,
-      { timeMin: past, timeMax: now, maxResults: '2500', singleEvents: 'true' });
-    return { service: 'Calendar (past year)', total: countData.items?.length || 0,
-      latest: data.items?.[0]?.updated || data.items?.[0]?.created || null, icon: '\u{1F4C5}' };
-  } catch (e) { return { service: 'Calendar', error: e.message, icon: '\u{1F4C5}' }; }
+      { timeMin: past, timeMax: now.toISOString(), maxResults: '250', singleEvents: 'true', orderBy: 'startTime' });
+    const events = data.items || [];
+    const total = events.length;
+    const latest = events[events.length - 1]?.updated || events[events.length - 1]?.created || null;
+
+    // Time-of-day distribution
+    const hourBuckets = { morning: 0, afternoon: 0, evening: 0, night: 0 };
+    const dayBuckets = {};
+    for (const evt of events) {
+      const start = evt.start?.dateTime || evt.start?.date;
+      if (!start) continue;
+      const d = new Date(start);
+      const h = d.getHours();
+      if (h >= 6 && h < 12) hourBuckets.morning++;
+      else if (h >= 12 && h < 17) hourBuckets.afternoon++;
+      else if (h >= 17 && h < 22) hourBuckets.evening++;
+      else hourBuckets.night++;
+      const day = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()];
+      dayBuckets[day] = (dayBuckets[day] || 0) + 1;
+    }
+    const busiestTime = Object.entries(hourBuckets).sort((a, b) => b[1] - a[1])[0];
+    const busiestDay = Object.entries(dayBuckets).sort((a, b) => b[1] - a[1])[0];
+
+    return {
+      service: 'Calendar', id: 'calendar', icon: '📅', total: `${total}+ events (past year)`, latest,
+      preview: {
+        headline: `${total}+ events in the past year`,
+        detail: busiestTime ? `heaviest in the ${busiestTime[0]} (${busiestTime[1]} events)` : null,
+        stat: busiestDay ? `busiest day: ${busiestDay[0]}` : null,
+        timeBuckets: hourBuckets,
+      },
+      richness: Math.min(1, total / 300),
+      description: 'when you commit to things, when you actually show up, how you structure time',
+    };
+  } catch (e) { return { service: 'Calendar', id: 'calendar', error: e.message, icon: '📅' }; }
 }
 
 async function getGmail(token) {
   try {
     const profile = await fetchGoogle('https://gmail.googleapis.com/gmail/v1/users/me/profile', token);
+    const total = profile.messagesTotal || 0;
+    // Get labels list for user labels
+    const labels = await fetchGoogle('https://gmail.googleapis.com/gmail/v1/users/me/labels', token);
+    const userLabels = (labels.labels || []).filter(l => l.type === 'user');
+    // Fetch INBOX and SENT individually — list endpoint doesn't include counts
+    const [inboxLabel, sentLabel] = await Promise.all([
+      fetchGoogle('https://gmail.googleapis.com/gmail/v1/users/me/labels/INBOX', token).catch(() => ({})),
+      fetchGoogle('https://gmail.googleapis.com/gmail/v1/users/me/labels/SENT', token).catch(() => ({})),
+    ]);
+    const unread = inboxLabel.messagesUnread || 0;
+    const sentCount = sentLabel.messagesTotal || 0;
+    // Get recent message for recency
     const messages = await fetchGoogle('https://gmail.googleapis.com/gmail/v1/users/me/messages', token, { maxResults: '1' });
     let latest = null;
     if (messages.messages?.[0]?.id) {
@@ -539,19 +623,50 @@ async function getGmail(token) {
         token, { format: 'metadata', metadataHeaders: 'Date' });
       latest = msg.payload?.headers?.find(h => h.name === 'Date')?.value || null;
     }
-    return { service: 'Gmail', total: profile.messagesTotal || 0, latest, icon: '\u{1F4E7}' };
-  } catch (e) { return { service: 'Gmail', error: e.message, icon: '\u{1F4E7}' }; }
+
+    return {
+      service: 'Gmail', id: 'gmail', icon: '📧', total, latest,
+      preview: {
+        headline: `${total.toLocaleString()} messages`,
+        detail: `${unread.toLocaleString()} unread · ${sentCount.toLocaleString()} sent · ${userLabels.length} labels`,
+        stat: userLabels.length > 0 ? `labels: ${userLabels.slice(0, 5).map(l => l.name).join(', ')}` : null,
+      },
+      richness: Math.min(1, total / 10000),
+      description: 'who gets your attention, who waits, how you respond to the world reaching out',
+    };
+  } catch (e) { return { service: 'Gmail', id: 'gmail', error: e.message, icon: '📧' }; }
 }
 
 async function getYouTube(token) {
   try {
-    const channels = await fetchGoogle('https://www.googleapis.com/youtube/v3/channels', token, { part: 'statistics', mine: 'true' });
+    const channels = await fetchGoogle('https://www.googleapis.com/youtube/v3/channels', token,
+      { part: 'statistics', mine: 'true' });
     const stats = channels.items?.[0]?.statistics || {};
-    const activities = await fetchGoogle('https://www.googleapis.com/youtube/v3/activities', token, { part: 'snippet', mine: 'true', maxResults: '1' });
-    return { service: 'YouTube',
-      total: `${stats.viewCount || 0} views, ${stats.subscriberCount || 0} subs, ${stats.videoCount || 0} videos`,
-      latest: activities.items?.[0]?.snippet?.publishedAt || null, icon: '\u{1F3AC}' };
-  } catch (e) { return { service: 'YouTube', error: e.message, icon: '\u{1F3AC}' }; }
+    // Get recent activities with more detail
+    const activities = await fetchGoogle('https://www.googleapis.com/youtube/v3/activities', token,
+      { part: 'snippet', mine: 'true', maxResults: '10' });
+    const recentTitles = (activities.items || []).slice(0, 5)
+      .map(a => a.snippet?.title).filter(Boolean);
+    const latest = activities.items?.[0]?.snippet?.publishedAt || null;
+    // Get subscriptions count
+    const subs = await fetchGoogle('https://www.googleapis.com/youtube/v3/subscriptions', token,
+      { part: 'snippet', mine: 'true', maxResults: '5' });
+    const subTotal = subs.pageInfo?.totalResults || 0;
+    const recentSubs = (subs.items || []).slice(0, 3)
+      .map(s => s.snippet?.title).filter(Boolean);
+
+    return {
+      service: 'YouTube', id: 'youtube', icon: '🎬', 
+      total: `${stats.viewCount || 0} views`, latest,
+      preview: {
+        headline: `${parseInt(stats.viewCount || 0).toLocaleString()} views · ${subTotal} subscriptions`,
+        detail: recentTitles.length > 0 ? `recent: ${recentTitles[0]}` : null,
+        stat: recentSubs.length > 0 ? `following: ${recentSubs.join(', ')}` : null,
+      },
+      richness: Math.min(1, (parseInt(stats.viewCount || 0) / 5000) + (subTotal / 100)),
+      description: 'what captures your attention, how deep you go, what you keep coming back to',
+    };
+  } catch (e) { return { service: 'YouTube', id: 'youtube', error: e.message, icon: '🎬' }; }
 }
 
 async function getYouTubeMusic(token) {
@@ -559,27 +674,38 @@ async function getYouTubeMusic(token) {
     const playlists = await fetchGoogle('https://www.googleapis.com/youtube/v3/playlists', token,
       { part: 'snippet,contentDetails', mine: 'true', maxResults: '50' });
     const likedVideos = await fetchGoogle('https://www.googleapis.com/youtube/v3/playlistItems', token,
-      { part: 'snippet,contentDetails', playlistId: 'LL', maxResults: '5' });
+      { part: 'snippet,contentDetails', playlistId: 'LL', maxResults: '10' });
     const likedTotal = likedVideos.pageInfo?.totalResults || 0;
-    const recentLiked = (likedVideos.items || []).map(item => ({
-      title: item.snippet?.title, channel: item.snippet?.videoOwnerChannelTitle, addedAt: item.snippet?.publishedAt }));
+    const recentLiked = (likedVideos.items || []).slice(0, 5).map(item => ({
+      title: item.snippet?.title, channel: item.snippet?.videoOwnerChannelTitle }));
     const latest = recentLiked[0]?.addedAt || playlists.items?.[0]?.snippet?.publishedAt || null;
-    const preview = recentLiked.slice(0, 3).map(r => `${r.title}${r.channel ? ' \u2014 ' + r.channel : ''}`);
-    return { service: 'YouTube Music', total: `${likedTotal} liked, ${playlists.items?.length || 0} playlists`,
-      latest, icon: '\u{1F3B5}', detail: preview.length > 0 ? 'recent: ' + preview.join(' | ') : null,
-      ingest: '/ingest/music' };
-  } catch (e) { return { service: 'YouTube Music', error: e.message, icon: '\u{1F3B5}' }; }
+    // Count unique artists
+    const artists = [...new Set(recentLiked.map(r => r.channel).filter(Boolean))];
+    const playlistNames = (playlists.items || []).slice(0, 3).map(p => p.snippet?.title).filter(Boolean);
+
+    return {
+      service: 'Music', id: 'music', icon: '🎵',
+      total: `${likedTotal} liked`, latest,
+      preview: {
+        headline: `${likedTotal} liked tracks · ${playlists.items?.length || 0} playlists`,
+        detail: recentLiked.length > 0
+          ? recentLiked.slice(0, 2).map(r => `${r.title} — ${r.channel || '?'}`).join(' · ')
+          : null,
+        stat: playlistNames.length > 0 ? `playlists: ${playlistNames.join(', ')}` : null,
+      },
+      richness: Math.min(1, likedTotal / 200 + (playlists.items?.length || 0) / 20),
+      description: 'what moves you, what you loop, the soundtrack to your focus and your chaos',
+    };
+  } catch (e) { return { service: 'Music', id: 'music', error: e.message, icon: '🎵' }; }
 }
 
 async function getFit(token) {
   try {
     const sources = await fetchGoogle('https://www.googleapis.com/fitness/v1/users/me/dataSources', token);
-    const total = (sources.dataSource || []).length;
-    const sourceTypes = {};
-    for (const ds of (sources.dataSource || [])) {
-      const t = ds.dataType?.name || 'unknown';
-      sourceTypes[t] = (sourceTypes[t] || 0) + 1;
-    }
+    const dataSourceList = sources.dataSource || [];
+    const total = dataSourceList.length;
+    const typeNames = [...new Set(dataSourceList.map(ds => (ds.dataType?.name || '').replace('com.google.', '')))].slice(0, 8);
+
     const now = Date.now(), dayAgo = now - 86400000;
     const aggRes = await fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate', {
       method: 'POST',
@@ -590,11 +716,10 @@ async function getFit(token) {
         bucketByTime: { durationMillis: 3600000 }, startTimeMillis: dayAgo, endTimeMillis: now }),
     });
     const aggData = await aggRes.json();
-    let latestTs = null, hr = 0, steps = 0, cal = 0, pts = 0;
+    let latestTs = null, hr = 0, steps = 0, cal = 0;
     for (const b of (aggData.bucket || []).reverse()) {
       for (const ds of (b.dataset || [])) {
         for (const pt of (ds.point || [])) {
-          pts++;
           const end = parseInt(pt.endTimeNanos) / 1000000;
           if (!latestTs || end > latestTs) latestTs = end;
           const tn = pt.dataTypeName || ds.dataSourceId || '';
@@ -604,42 +729,98 @@ async function getFit(token) {
         }
       }
     }
-    const parts = [`${total} sources`];
-    if (hr > 0) parts.push(`${hr} HR (24h)`);
-    if (steps > 0) parts.push(`${steps} step records (24h)`);
-    if (cal > 0) parts.push(`${cal} cal records (24h)`);
-    if (pts === 0) parts.push('no data 24h');
-    const types = Object.keys(sourceTypes).map(t => t.replace('com.google.', '')).slice(0, 6);
-    return { service: 'Google Fit', total: parts.join(', '),
-      latest: latestTs ? new Date(latestTs).toISOString() : null, icon: '\u{1F4AA}',
-      detail: `types: ${types.join(', ')}` };
-  } catch (e) { return { service: 'Google Fit', error: e.message, icon: '\u{1F4AA}' }; }
+
+    const bodyParts = [];
+    if (hr > 0) bodyParts.push(`${hr} heart rate readings`);
+    if (steps > 0) bodyParts.push(`${steps} step records`);
+    if (cal > 0) bodyParts.push(`${cal} calorie records`);
+
+    return {
+      service: 'Body', id: 'fitness', icon: '💪',
+      total: `${total} data sources`, latest: latestTs ? new Date(latestTs).toISOString() : null,
+      preview: {
+        headline: `${total} data sources streaming`,
+        detail: bodyParts.length > 0 ? `last 24h: ${bodyParts.join(' · ')}` : 'no data in last 24h',
+        stat: typeNames.length > 0 ? `tracking: ${typeNames.join(', ')}` : null,
+      },
+      richness: Math.min(1, total / 10 + (hr + steps + cal) / 50),
+      description: 'when your body is activated, when it crashes, the rhythms underneath everything',
+    };
+  } catch (e) { return { service: 'Body', id: 'fitness', error: e.message, icon: '💪' }; }
 }
 
 async function getTasks(token) {
   try {
     const lists = await fetchGoogle('https://tasks.googleapis.com/tasks/v1/users/@me/lists', token);
     const totalLists = lists.items?.length || 0;
-    let totalTasks = 0, latest = null;
+    let totalTasks = 0, completed = 0, latest = null;
+    const listNames = [];
     for (const list of (lists.items || []).slice(0, 5)) {
+      listNames.push(list.title);
       const tasks = await fetchGoogle(`https://tasks.googleapis.com/tasks/v1/lists/${list.id}/tasks`, token,
         { maxResults: '100', showCompleted: 'true' });
-      totalTasks += tasks.items?.length || 0;
-      const lt = tasks.items?.[0]?.updated;
+      const items = tasks.items || [];
+      totalTasks += items.length;
+      completed += items.filter(t => t.status === 'completed').length;
+      const lt = items[0]?.updated;
       if (lt && (!latest || lt > latest)) latest = lt;
     }
-    return { service: 'Tasks', total: `${totalTasks} tasks in ${totalLists} lists`, latest, icon: '\u{2705}' };
-  } catch (e) { return { service: 'Tasks', error: e.message, icon: '\u{2705}' }; }
+    const completionRate = totalTasks > 0 ? Math.round(completed / totalTasks * 100) : 0;
+
+    return {
+      service: 'Tasks', id: 'tasks', icon: '✅',
+      total: `${totalTasks} tasks`, latest,
+      preview: {
+        headline: `${totalTasks} tasks across ${totalLists} lists`,
+        detail: `${completionRate}% completion rate — ${completed} done, ${totalTasks - completed} open`,
+        stat: listNames.length > 0 ? `lists: ${listNames.join(', ')}` : null,
+      },
+      richness: Math.min(1, totalTasks / 100),
+      description: 'what you intended to do vs what you actually did — the gap tells a story',
+    };
+  } catch (e) { return { service: 'Tasks', id: 'tasks', error: e.message, icon: '✅' }; }
 }
 
 async function getDrive(token) {
   try {
     const about = await fetchGoogle('https://www.googleapis.com/drive/v3/about', token, { fields: 'storageQuota,user' });
+    // Get recent files with types
     const files = await fetchGoogle('https://www.googleapis.com/drive/v3/files', token,
-      { pageSize: '1', orderBy: 'modifiedTime desc', fields: 'files(name,modifiedTime)' });
+      { pageSize: '20', orderBy: 'modifiedTime desc', fields: 'files(name,mimeType,modifiedTime,createdTime)',
+        q: 'trashed=false' });
+    const fileList = files.files || [];
+    const latest = fileList[0]?.modifiedTime || null;
     const usedGB = about.storageQuota ? (parseInt(about.storageQuota.usage) / (1024**3)).toFixed(2) : '?';
-    return { service: 'Drive', total: `${usedGB} GB used`, latest: files.files?.[0]?.modifiedTime || null, icon: '\u{1F4C1}' };
-  } catch (e) { return { service: 'Drive', error: e.message, icon: '\u{1F4C1}' }; }
+
+    // Analyze file types
+    const types = {};
+    for (const f of fileList) {
+      const mime = f.mimeType || '';
+      let type = 'other';
+      if (mime.includes('document')) type = 'docs';
+      else if (mime.includes('spreadsheet')) type = 'sheets';
+      else if (mime.includes('presentation')) type = 'slides';
+      else if (mime.includes('image')) type = 'images';
+      else if (mime.includes('pdf')) type = 'pdfs';
+      else if (mime.includes('folder')) type = 'folders';
+      types[type] = (types[type] || 0) + 1;
+    }
+    const typeStr = Object.entries(types).filter(([k]) => k !== 'folders')
+      .sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${v} ${k}`).join(', ');
+    const recentNames = fileList.filter(f => !f.mimeType?.includes('folder')).slice(0, 3).map(f => f.name);
+
+    return {
+      service: 'Drive', id: 'drive', icon: '📁',
+      total: `${usedGB} GB`, latest,
+      preview: {
+        headline: `${usedGB} GB used`,
+        detail: recentNames.length > 0 ? `recent: ${recentNames.join(', ')}` : null,
+        stat: typeStr ? `last 20 files: ${typeStr}` : null,
+      },
+      richness: Math.min(1, parseFloat(usedGB) / 5),
+      description: 'what you created, what you abandoned, where your momentum lives and dies',
+    };
+  } catch (e) { return { service: 'Drive', id: 'drive', error: e.message, icon: '📁' }; }
 }
 
 // ---- LEGACY MUSIC INGEST ----
@@ -729,7 +910,7 @@ async function explorerPage(url, env) {
     cards = results.map(r => r.status === 'fulfilled' ? r.value : { service: 'Unknown', error: r.reason });
   }
 
-  return new Response(renderExplorer(cards, ptoken), {
+  return new Response(renderExplorer(cards, token, ptoken), {
     headers: { 'Content-Type': 'text/html; charset=utf-8' }
   });
 }
@@ -740,12 +921,12 @@ function formatDate(dateStr) {
     const d = new Date(dateStr);
     const ms = Date.now() - d;
     const mins = Math.floor(ms / 60000), hrs = Math.floor(ms / 3600000), days = Math.floor(ms / 86400000);
-    if (mins < 60) return `${mins} min ago`;
-    if (hrs < 24) return `${hrs} hours ago`;
-    if (days < 7) return `${days} days ago`;
-    if (days < 30) return `${Math.floor(days / 7)} weeks ago`;
-    if (days < 365) return `${Math.floor(days / 30)} months ago`;
-    return `${Math.floor(days / 365)} years ago`;
+    if (mins < 60) return `${mins}m ago`;
+    if (hrs < 24) return `${hrs}h ago`;
+    if (days < 7) return `${days}d ago`;
+    if (days < 30) return `${Math.floor(days / 7)}w ago`;
+    if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+    return `${Math.floor(days / 365)}y ago`;
   } catch { return dateStr; }
 }
 
@@ -761,35 +942,54 @@ function recencyColor(dateStr) {
   } catch { return '#333'; }
 }
 
+function richnessBars(richness) {
+  const filled = Math.round((richness || 0) * 5);
+  return Array.from({ length: 5 }, (_, i) =>
+    `<span class="bar ${i < filled ? 'filled' : ''}"></span>`
+  ).join('');
+}
+
 function escapeHtml(str) {
-  if (typeof str !== 'string') return str;
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-function renderExplorer(cards, ptoken) {
+function renderExplorer(cards, token, ptoken) {
+  const esc = escapeHtml;
   const cardHtml = cards.map(card => {
     if (card.error && !card.service) return '';
     const color = recencyColor(card.latest);
-    const recency = escapeHtml(formatDate(card.latest));
-    const serviceName = escapeHtml(card.service);
-    const safeTotal = escapeHtml(String(card.total || ''));
-    const safeDetail = card.detail ? escapeHtml(card.detail) : '';
-    const safeError = escapeHtml(typeof card.error === 'string' ? card.error : 'unavailable');
-    const safeDataService = serviceName.replace(/[^a-zA-Z0-9_ -]/g, '');
-    return `<div class="card" data-service="${safeDataService}">
+    const recency = formatDate(card.latest);
+    const p = card.preview || {};
+    const id = card.id || card.service.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+
+    if (card.error) {
+      return `<div class="card unavailable" data-id="${esc(id)}">
+        <div class="card-header">
+          <span class="icon">${card.icon || '📊'}</span>
+          <span class="service-name">${esc(card.service)}</span>
+        </div>
+        <div class="card-error">unavailable</div>
+      </div>`;
+    }
+
+    return `<div class="card" data-id="${esc(id)}">
       <div class="card-header">
-        <span class="icon">${card.icon || '\u{1F4CA}'}</span>
-        <span class="service-name">${serviceName}</span>
-        <span class="recency-dot" style="background:${color}" title="${recency}"></span>
+        <span class="icon">${card.icon || '📊'}</span>
+        <span class="service-name">${esc(card.service)}</span>
+        <span class="recency-dot" style="background:${color}" title="${esc(recency)}"></span>
       </div>
-      ${card.error
-        ? `<div class="volume error">error: ${safeError}</div>`
-        : `<div class="volume">${safeTotal}</div>
-           ${safeDetail ? `<div class="detail">${safeDetail}</div>` : ''}
-           <div class="recency">last activity: <strong>${recency}</strong></div>
-           ${card.ingest ? `<button class="ingest-btn" onclick="ingest('${card.ingest}', this)">connect to graph</button>` : ''}`}
-      <div class="card-status"></div>
+      <div class="card-headline">${esc(p.headline || card.total || '')}</div>
+      ${p.detail ? `<div class="card-detail">${esc(p.detail)}</div>` : ''}
+      ${p.stat ? `<div class="card-stat">${esc(p.stat)}</div>` : ''}
+      <div class="card-footer">
+        <span class="card-recency">${esc(recency)}</span>
+        <span class="card-richness">${richnessBars(card.richness)}</span>
+      </div>
+      ${card.description ? `<div class="card-desc">${esc(card.description)}</div>` : ''}
+      <button class="add-btn" id="btn-${esc(id)}" onclick="addToGraph('${esc(id)}', this)">add to graph</button>
+      <div class="card-status" id="status-${esc(id)}"></div>
     </div>`;
   }).join('');
 
@@ -800,203 +1000,233 @@ function renderExplorer(cards, ptoken) {
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: #0a0a0a; color: #e0e0e0; min-height: 100vh; padding: 2rem; }
-  h1 { font-size: 1.8rem; margin-bottom: 0.3rem; color: #fff; }
-  .subtitle { color: #666; margin-bottom: 1rem; font-size: 0.95rem; }
-  .deep-import { background: linear-gradient(135deg, #0f0f1a 0%, #1a0f1a 100%);
-    border: 1px solid #2a2040; border-radius: 12px; padding: 1.25rem;
-    margin-bottom: 1.5rem; max-width: 1000px; }
-  .deep-import h2 { font-size: 1.1rem; color: #c4b5fd; margin-bottom: 0.4rem; }
-  .deep-import p { font-size: 0.85rem; color: #888; margin-bottom: 1rem; line-height: 1.4; }
-  .deep-import-btn { padding: 0.6rem 1.2rem; background: #2d1f5e; border: 1px solid #4c3a8e;
-    color: #c4b5fd; border-radius: 8px; cursor: pointer; font-size: 0.9rem; transition: all 0.2s; }
-  .deep-import-btn:hover { background: #3d2f6e; border-color: #6c5aae; }
-  .deep-import-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .deep-import-status { margin-top: 0.75rem; font-size: 0.8rem; color: #666; min-height: 1em; }
-  .deep-import-progress { margin-top: 0.5rem; display: none; }
-  .job-row { display: flex; justify-content: space-between; padding: 0.25rem 0;
-    font-size: 0.75rem; border-bottom: 1px solid #1a1a2a; }
-  .job-resource { color: #888; }
-  .job-state { font-weight: 500; }
-  .job-state.complete { color: #22c55e; }
-  .job-state.in-progress { color: #eab308; }
-  .job-state.failed { color: #ef4444; }
-  .graph-status { background: #111; border: 1px solid #222; border-radius: 8px;
-    padding: 0.75rem 1rem; margin-bottom: 1.5rem; max-width: 1000px;
-    font-size: 0.9rem; color: #888; display: none; align-items: center; gap: 0.75rem; }
-  .graph-status.has-data { display: flex; }
-  .graph-status .dot { width: 8px; height: 8px; border-radius: 50%; background: #333; flex-shrink: 0; }
-  .graph-status.connected .dot { background: #22c55e; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: 1rem; max-width: 1000px; }
-  .card { background: #141414; border: 1px solid #222; border-radius: 12px;
-    padding: 1.25rem; transition: border-color 0.2s; }
-  .card:hover { border-color: #444; }
+  h1 { font-size: 2rem; margin-bottom: 0.3rem; color: #fff; }
+  .subtitle { color: #666; margin-bottom: 2rem; font-size: 0.95rem; max-width: 700px; line-height: 1.5; }
+
+  .graph-viz {
+    max-width: 1100px; margin-bottom: 2rem; background: #0d0d12;
+    border: 1px solid #1a1a2a; border-radius: 14px; padding: 1.25rem;
+    min-height: 80px; display: none;
+  }
+  .graph-viz.has-data { display: block; }
+  .graph-viz-label { font-size: 0.75rem; color: #555; margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .graph-bubbles { display: flex; align-items: flex-end; gap: 1.25rem; flex-wrap: wrap; }
+  .graph-bubble { display: flex; flex-direction: column; align-items: center; gap: 0.3rem; transition: all 0.5s ease; }
+  .graph-bubble .circle {
+    border-radius: 50%; transition: all 0.5s ease;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; font-weight: 600;
+  }
+  .graph-bubble .label { font-size: 0.7rem; color: #666; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1rem; max-width: 1100px; }
+  .card {
+    background: #111; border: 2px solid #1a1a1a; border-radius: 14px;
+    padding: 1.5rem; transition: all 0.3s ease; position: relative; overflow: hidden;
+  }
+  .card:hover { border-color: #282828; }
+  .card.added { border-color: #2d5a2d; }
+  .card.unavailable { opacity: 0.3; }
   .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
-  .icon { font-size: 1.4rem; }
-  .service-name { font-weight: 600; font-size: 1.05rem; flex: 1; }
+  .icon { font-size: 1.5rem; }
+  .service-name { font-weight: 600; font-size: 1.1rem; flex: 1; color: #fff; }
   .recency-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-  .volume { font-size: 1.3rem; color: #fff; margin-bottom: 0.4rem; }
-  .volume.error { color: #ef4444; font-size: 0.85rem; }
-  .detail { font-size: 0.8rem; color: #666; margin-bottom: 0.3rem; }
-  .recency { font-size: 0.85rem; color: #888; }
-  .recency strong { color: #bbb; }
-  .ingest-btn { margin-top: 0.75rem; padding: 0.5rem 1rem; background: #1a1a2e;
+  .card-headline { font-size: 1.1rem; color: #ddd; margin-bottom: 0.5rem; line-height: 1.3; }
+  .card-detail { font-size: 0.85rem; color: #888; margin-bottom: 0.35rem; line-height: 1.4;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-stat { font-size: 0.8rem; color: #666; margin-bottom: 0.5rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-error { font-size: 0.85rem; color: #555; }
+  .card-footer { display: flex; justify-content: space-between; align-items: center;
+    margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px solid #1a1a1a; }
+  .card-recency { font-size: 0.8rem; color: #555; }
+  .card-richness { display: flex; gap: 3px; }
+  .bar { width: 4px; height: 14px; border-radius: 2px; background: #222; }
+  .bar.filled { background: #6c5aae; }
+  .card-desc { font-size: 0.8rem; color: #444; margin-top: 0.6rem; font-style: italic; line-height: 1.4; }
+  .add-btn {
+    margin-top: 0.75rem; padding: 0.5rem 1rem; background: #1a1a2e;
     border: 1px solid #333; color: #8b8bce; border-radius: 6px;
-    cursor: pointer; font-size: 0.85rem; transition: all 0.2s; width: 100%; }
-  .ingest-btn:hover { background: #222244; border-color: #555; color: #aaaaee; }
-  .ingest-btn.running { background: #1a2e1a; border-color: #2d5a2d; color: #88cc88; cursor: wait; }
-  .ingest-btn.done { background: #1a2e1a; border-color: #22c55e; color: #22c55e; }
-  .ingest-btn.error { background: #2e1a1a; border-color: #ef4444; color: #ef4444; }
+    cursor: pointer; font-size: 0.85rem; transition: all 0.2s; width: 100%;
+  }
+  .add-btn:hover { background: #222244; border-color: #555; color: #aaaaee; }
+  .add-btn.running { background: #1a2e1a; border-color: #2d5a2d; color: #88cc88; cursor: wait; }
+  .add-btn.done { background: #1a2e1a; border-color: #22c55e; color: #22c55e; cursor: default; }
+  .add-btn.error { background: #2e1a1a; border-color: #ef4444; color: #ef4444; }
   .card-status { font-size: 0.75rem; color: #666; margin-top: 0.4rem; min-height: 1em; }
-  .legend { margin-top: 2rem; display: flex; gap: 1.5rem; font-size: 0.8rem; color: #666; }
-  .legend-item { display: flex; align-items: center; gap: 0.3rem; }
-  .legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 </style></head><body>
-<h1>your data</h1>
-<div class="subtitle">volume and recency across your google account</div>
 
-<div class="deep-import">
-  <h2>deep import</h2>
-  <p>the cards below show what's happening now. deep import pulls your full behavioral
-  history \u2014 every search, every watch, every rabbit hole \u2014 and maps it into a
-  graph of how your attention actually works.</p>
-  <button class="deep-import-btn" id="deepImportBtn" onclick="startDeepImport()">
-    ${ptoken ? 'begin deep import' : 'authorize deep import'}
-  </button>
-  <div class="deep-import-status" id="deepImportStatus"></div>
-  <div class="deep-import-progress" id="deepImportProgress"></div>
+<h1>this is yours</h1>
+<div class="subtitle">this is what google has been watching. add the parts you want to understand — one at a time. watch the graph grow.</div>
+
+<div class="graph-viz" id="graphViz">
+  <div class="graph-viz-label">your graph</div>
+  <div class="graph-bubbles" id="graphBubbles"></div>
 </div>
 
-<div class="graph-status" id="graphStatus">
-  <span class="dot"></span>
-  <span id="graphStatusText">checking graph...</span>
-</div>
-
-${cards.length > 0 ? `<div class="grid">${cardHtml}</div>` : ''}
-
-<div class="legend">
-  <div class="legend-item"><span class="legend-dot" style="background:#22c55e"></span> today</div>
-  <div class="legend-item"><span class="legend-dot" style="background:#84cc16"></span> this week</div>
-  <div class="legend-item"><span class="legend-dot" style="background:#eab308"></span> this month</div>
-  <div class="legend-item"><span class="legend-dot" style="background:#f97316"></span> this quarter</div>
-  <div class="legend-item"><span class="legend-dot" style="background:#ef4444"></span> stale</div>
-</div>
+${cards.length > 0 ? '<div class="grid">' + cardHtml + '</div>' : ''}
 
 <script>
-const token = new URLSearchParams(window.location.search).get('token');
-const ptoken = new URLSearchParams(window.location.search).get('ptoken');
-let archiveJobs = [];
+const token = ${JSON.stringify(token || '')};
+const ptoken = ${JSON.stringify(ptoken || '')};
 
-async function checkGraphStatus() {
-  try {
-    const [g, s] = await Promise.all([
-      fetch('/graph/stats?token=' + (token || ptoken)).then(r => r.json()).catch(() => null),
-      fetch('/ingest/status?token=' + (token || ptoken)).then(r => r.json()).catch(() => null),
-    ]);
-    const el = document.getElementById('graphStatus');
-    const text = document.getElementById('graphStatusText');
-    const parts = [];
-    if (g?.activities > 0) { parts.push(g.activities+' activities', g.topics+' topics', g.chains+' chains'); }
-    if (s?.songs > 0) { parts.push(s.songs+' songs', s.artists+' artists'); }
-    if (parts.length > 0) {
-      el.classList.add('connected', 'has-data');
-      text.textContent = 'graph: ' + parts.join(', ');
-    }
-  } catch(e) {}
-}
+const BUBBLE_COLORS = {
+  songs: '#8b5cf6', artists: '#a78bfa', activities: '#6366f1',
+  topics: '#818cf8', products: '#c084fc', chains: '#7c3aed'
+};
 
-async function startDeepImport() {
-  const btn = document.getElementById('deepImportBtn');
-  const status = document.getElementById('deepImportStatus');
-  if (!ptoken) { window.location.href = '/login/portability'; return; }
-  btn.disabled = true;
-  btn.textContent = 'initiating archives...';
-  status.textContent = 'requesting data export from google...';
-  try {
-    await fetch('/graph/schema?ptoken=' + encodeURIComponent(ptoken));
-    const res = await fetch('/portability/initiate?ptoken=' + encodeURIComponent(ptoken));
-    const data = await res.json();
-    if (data.jobs?.length > 0) {
-      archiveJobs = data.jobs;
-      btn.textContent = data.jobs.length + ' archives initiated';
-      status.textContent = 'waiting for google to prepare your data...';
-      renderProgress(data.jobs.map(j => ({ ...j, state: 'IN_PROGRESS' })));
-      if (data.errors.length > 0) status.textContent += ' (' + data.errors.length + ' unavailable)';
-      pollArchiveStatus();
-    } else {
-      btn.textContent = 'no archives created';
-      status.textContent = JSON.stringify(data.errors || 'unknown');
-    }
-  } catch(e) { btn.textContent = 'error'; status.textContent = e.message; }
-}
-
-async function pollArchiveStatus() {
-  const status = document.getElementById('deepImportStatus');
-  const btn = document.getElementById('deepImportBtn');
-  try {
-    const jobsParam = encodeURIComponent(JSON.stringify(archiveJobs));
-    const res = await fetch('/portability/status?ptoken=' + encodeURIComponent(ptoken) + '&jobs=' + jobsParam);
-    const data = await res.json();
-    renderProgress(data.statuses);
-    if (data.allComplete) {
-      status.textContent = data.readyCount + '/' + data.total + ' ready. ingesting...';
-      let processed = 0;
-      for (const s of data.statuses) {
-        if (s.state === 'COMPLETE' && s.urls?.length > 0) {
-          for (const u of s.urls) {
-            status.textContent = 'ingesting ' + s.resource + '...';
-            try {
-              const r = await fetch('/portability/process?ptoken=' + encodeURIComponent(ptoken) +
-                '&resource=' + encodeURIComponent(s.resource) + '&url=' + encodeURIComponent(u));
-              const d = await r.json();
-              if (d.success) processed++;
-            } catch(e) { console.error(s.resource, e); }
-          }
-        }
-      }
-      btn.textContent = 'complete \u2014 ' + processed + ' sources';
-      btn.style.borderColor = '#22c55e'; btn.style.color = '#22c55e';
-      status.textContent = 'behavioral graph built.';
-      checkGraphStatus();
-    } else {
-      status.textContent = data.readyCount + '/' + data.total + ' ready. checking in 30s...';
-      setTimeout(pollArchiveStatus, 30000);
-    }
-  } catch(e) { status.textContent = 'error: ' + e.message; setTimeout(pollArchiveStatus, 30000); }
-}
-
-function renderProgress(statuses) {
-  const el = document.getElementById('deepImportProgress');
-  el.style.display = 'block';
-  el.innerHTML = statuses.map(s => {
-    const c = s.state === 'COMPLETE' ? 'complete' : (s.state === 'FAILED' || s.state === 'ERROR') ? 'failed' : 'in-progress';
-    return '<div class="job-row"><span class="job-resource">'+s.resource+'</span><span class="job-state '+c+'">'+s.state.toLowerCase()+'</span></div>';
+function renderGraphViz(data) {
+  const viz = document.getElementById('graphViz');
+  const container = document.getElementById('graphBubbles');
+  const entries = [];
+  if (data.songs > 0) entries.push({ label: 'songs', count: data.songs, color: BUBBLE_COLORS.songs });
+  if (data.artists > 0) entries.push({ label: 'artists', count: data.artists, color: BUBBLE_COLORS.artists });
+  if (data.activities > 0) entries.push({ label: 'activities', count: data.activities, color: BUBBLE_COLORS.activities });
+  if (data.topics > 0) entries.push({ label: 'topics', count: data.topics, color: BUBBLE_COLORS.topics });
+  if (data.products > 0) entries.push({ label: 'sources', count: data.products, color: BUBBLE_COLORS.products });
+  if (data.chains > 0) entries.push({ label: 'chains', count: data.chains, color: BUBBLE_COLORS.chains });
+  if (entries.length === 0) { viz.classList.remove('has-data'); return; }
+  viz.classList.add('has-data');
+  const maxCount = Math.max(...entries.map(e => e.count));
+  container.innerHTML = entries.map(e => {
+    const size = Math.max(40, Math.min(100, 40 + Math.sqrt(e.count / maxCount) * 60));
+    return '<div class="graph-bubble">'
+      + '<div class="circle" style="width:'+size+'px;height:'+size+'px;background:'+e.color+'18;border:2px solid '+e.color+'">'
+      + '<span style="color:'+e.color+'">'+(e.count > 999 ? (e.count/1000).toFixed(1)+'k' : e.count)+'</span>'
+      + '</div><span class="label">'+e.label+'</span></div>';
   }).join('');
 }
 
-async function ingest(endpoint, btn) {
-  if (btn.classList.contains('running')) return;
-  btn.classList.add('running'); btn.textContent = 'connecting...';
-  const st = btn.parentElement.querySelector('.card-status');
-  st.textContent = 'pulling data...';
+async function loadGraphStats() {
   try {
-    const res = await fetch(endpoint + '?token=' + token);
-    const data = await res.json();
-    if (data.success) {
-      btn.classList.remove('running'); btn.classList.add('done');
-      btn.textContent = 'connected \u2014 ' + data.totalSongs + ' songs';
-      st.textContent = data.sampleArtists.slice(0, 5).join(', ') + '...';
-      checkGraphStatus();
-    } else {
+    const [g, s] = await Promise.all([
+      fetch('/graph/stats?token='+(token||ptoken)).then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch('/ingest/status?token='+(token||ptoken)).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    renderGraphViz({
+      songs: s?.songs||0, artists: s?.artists||0,
+      activities: g?.activities||0, topics: g?.topics||0,
+      products: g?.products||0, chains: g?.chains||0,
+    });
+  } catch(e) {}
+}
+
+async function addToGraph(cardId, btn) {
+  if (btn.classList.contains('running') || btn.classList.contains('done')) return;
+  btn.classList.add('running');
+  btn.textContent = 'adding...';
+  const status = document.getElementById('status-' + cardId);
+
+  if (cardId === 'music') {
+    status.textContent = 'pulling liked songs from youtube...';
+    try {
+      const res = await fetch('/ingest/music?token=' + token);
+      const data = await res.json();
+      if (data.success) {
+        btn.classList.remove('running'); btn.classList.add('done');
+        btn.textContent = 'added \u2014 ' + data.totalSongs + ' songs';
+        btn.closest('.card').classList.add('added');
+        status.textContent = data.sampleArtists?.slice(0,5).join(', ');
+        loadGraphStats();
+      } else {
+        btn.classList.remove('running'); btn.classList.add('error');
+        btn.textContent = 'error'; status.textContent = data.error || 'unknown';
+      }
+    } catch(e) {
       btn.classList.remove('running'); btn.classList.add('error');
-      btn.textContent = 'error'; st.textContent = data.error || 'unknown';
+      btn.textContent = 'error'; status.textContent = e.message;
     }
+    return;
+  }
+
+  // Other cards need portability auth
+  if (!ptoken) {
+    btn.classList.remove('running');
+    btn.textContent = 'needs deep access';
+    status.textContent = 'redirecting to authorize...';
+    try { sessionStorage.setItem('pendingAdd', cardId); } catch(e) {}
+    setTimeout(() => { window.location.href = '/login/portability'; }, 1500);
+    return;
+  }
+
+  const resourceMap = {
+    youtube: 'myactivity.youtube', gmail: 'myactivity.search',
+    calendar: 'myactivity.maps', contacts: 'saved.collections',
+    fitness: 'myactivity.play', tasks: 'myactivity.shopping',
+    drive: 'chrome.history',
+  };
+  const resource = resourceMap[cardId];
+  if (!resource) {
+    btn.classList.remove('running'); btn.classList.add('error');
+    btn.textContent = 'not available yet'; return;
+  }
+
+  status.textContent = 'requesting archive from google...';
+  try {
+    const initRes = await fetch('/portability/initiate?ptoken='+encodeURIComponent(ptoken));
+    const initData = await initRes.json();
+    const job = initData.jobs?.find(j => j.resource === resource);
+    if (!job?.jobId) {
+      btn.classList.remove('running'); btn.classList.add('error');
+      btn.textContent = 'failed'; status.textContent = 'archive unavailable';
+      return;
+    }
+    status.textContent = 'google is preparing your data...';
+    pollSingleJob(job, resource, btn, status);
   } catch(e) {
     btn.classList.remove('running'); btn.classList.add('error');
-    btn.textContent = 'error'; st.textContent = e.message;
+    btn.textContent = 'error'; status.textContent = e.message;
   }
 }
 
-checkGraphStatus();
+async function pollSingleJob(job, resource, btn, status) {
+  try {
+    const jobsParam = encodeURIComponent(JSON.stringify([job]));
+    const res = await fetch('/portability/status?ptoken='+encodeURIComponent(ptoken)+'&jobs='+jobsParam);
+    const data = await res.json();
+    const s = data.statuses?.[0];
+    if (!s) { status.textContent = 'no status'; return; }
+    if (s.state === 'COMPLETE') {
+      status.textContent = 'ingesting into graph...';
+      let ok = false;
+      for (const u of (s.urls || [])) {
+        const r = await fetch('/portability/process?ptoken='+encodeURIComponent(ptoken)
+          +'&resource='+encodeURIComponent(resource)+'&url='+encodeURIComponent(u));
+        const d = await r.json();
+        if (d.success) ok = true;
+      }
+      if (ok) {
+        btn.classList.remove('running'); btn.classList.add('done');
+        btn.textContent = 'added'; btn.closest('.card').classList.add('added');
+        status.textContent = 'in your graph'; loadGraphStats();
+      } else {
+        btn.classList.remove('running'); btn.classList.add('error');
+        btn.textContent = 'ingest failed';
+      }
+    } else if (s.state === 'FAILED') {
+      btn.classList.remove('running'); btn.classList.add('error');
+      btn.textContent = 'failed'; status.textContent = s.error || '';
+    } else {
+      status.textContent = s.state.toLowerCase() + '... checking in 15s';
+      setTimeout(() => pollSingleJob(job, resource, btn, status), 15000);
+    }
+  } catch(e) {
+    status.textContent = 'retrying...';
+    setTimeout(() => pollSingleJob(job, resource, btn, status), 15000);
+  }
+}
+
+try {
+  const pending = sessionStorage.getItem('pendingAdd');
+  if (pending && ptoken) {
+    sessionStorage.removeItem('pendingAdd');
+    const btn = document.getElementById('btn-' + pending);
+    if (btn) setTimeout(() => addToGraph(pending, btn), 500);
+  }
+} catch(e) {}
+
+loadGraphStats();
 </script></body></html>`;
+
 }
