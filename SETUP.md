@@ -1,73 +1,67 @@
 # Google Data Explorer - Setup
 
-## 1. Google Cloud Project
+## Architecture
 
-Go to console.cloud.google.com
+Two-layer data pipeline:
+- **Layer 1** (Live APIs): Individual Google service APIs for real-time data cards
+- **Layer 2** (Data Portability API): Bulk historical behavioral export → Neo4j graph
 
-- Create a new project (or use existing)
-- Go to APIs & Services > Library and enable:
-  - People API
-  - Google Calendar API
-  - Gmail API
-  - YouTube Data API v3
-  - Fitness API
-  - Tasks API
-  - Google Drive API
+These use **separate OAuth flows** because Google requires Data Portability scopes
+to be in their own consent flow, not mixed with other API scopes.
 
-## 2. OAuth Credentials
+## Deployment
 
-Go to APIs & Services > Credentials
+Worker: `https://google-data-explorer.empyreanbuilders.workers.dev`
 
-- Click Create Credentials > OAuth client ID
-- Application type: Web application
-- Name: whatever you want
-- Authorized redirect URIs: add your worker URL + /callback
-  - e.g. https://google-data-explorer.your-subdomain.workers.dev/callback
-  - for local testing: http://localhost:8787/callback
-- Save the Client ID and Client Secret
+Secrets (already configured via Cloudflare API):
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `REDIRECT_URI` = `https://google-data-explorer.empyreanbuilders.workers.dev/callback`
+- `PORTABILITY_REDIRECT_URI` = `https://google-data-explorer.empyreanbuilders.workers.dev/callback/portability`
+- `NEO4J_URI`
+- `NEO4J_USERNAME`
+- `NEO4J_PASSWORD`
+- `NEO4J_DATABASE`
 
-If you haven't configured the OAuth consent screen yet:
-- Go to APIs & Services > OAuth consent screen
-- User type: External
-- Add your email as a test user
-- Fill in the minimum required fields
-- Add the scopes for each API above
+## Google Cloud Project
 
-## 3. Deploy the Worker
+APIs enabled:
+- People API, Calendar API, Gmail API, YouTube Data API v3,
+  Fitness API, Tasks API, Drive API
+- **Data Portability API** (for deep import)
 
-```bash
-cd google-data-explorer
-npx wrangler secret put GOOGLE_CLIENT_ID
-# paste your client ID
+OAuth consent screen must include Data Portability scopes (restricted/sensitive).
+Both redirect URIs must be registered in the OAuth client:
+- `.../callback`
+- `.../callback/portability`
 
-npx wrangler secret put GOOGLE_CLIENT_SECRET
-# paste your client secret
+## Graph Model
 
-npx wrangler secret put REDIRECT_URI
-# paste: https://google-data-explorer.your-subdomain.workers.dev/callback
+After deep import, Neo4j contains:
 
-npx wrangler deploy
-```
+**Nodes:**
+- `Activity` — every timestamped action (watch, search, visit, install)
+- `Topic` — extracted subjects from activity titles
+- `Hour` — 0-23, your circadian fingerprint
+- `Day` — Sunday-Saturday
+- `Product` — YouTube, Search, Maps, etc.
+- `Song` — from YouTube Music ingest
+- `Artist` — from YouTube Music ingest
 
-## 4. Test locally first (optional)
-
-```bash
-# Create a .dev.vars file with your secrets
-echo 'GOOGLE_CLIENT_ID=your-id-here' > .dev.vars
-echo 'GOOGLE_CLIENT_SECRET=your-secret-here' >> .dev.vars
-echo 'REDIRECT_URI=http://localhost:8787/callback' >> .dev.vars
-
-npx wrangler dev
-```
-
-Then open http://localhost:8787 and sign in.
+**Relationships:**
+- `(Activity)-[:THEN {gap_ms}]->(Activity)` — sequential attention chain
+- `(Activity)-[:ABOUT]->(Topic)` — what pulled your attention
+- `(Activity)-[:AT]->(Hour)` — when your brain was doing it
+- `(Activity)-[:ON]->(Day)` — day-of-week patterns
+- `(Activity)-[:USING]->(Product)` — which service
+- `(Song)-[:BY]->(Artist)` — music graph
 
 ## Notes
 
-- The token is passed via URL parameter. This is fine for a personal 
-  prototype but not production-grade. Later we'd move to encrypted 
-  cookies or KV-backed sessions.
-- Google OAuth consent screen in "Testing" mode limits to 100 test 
-  users and tokens expire in 7 days. That's fine for now.
-- Some APIs might return errors if you haven't used that service much.
-  That's expected - the card will show the error and you move on.
+- Data Portability API requires app verification for production. In testing
+  mode, tokens expire in 7 days.
+- Data Portability scopes CANNOT be mixed with regular API scopes in the
+  same OAuth flow. The worker handles this with two separate login paths.
+- Archive jobs can take minutes to hours depending on data volume.
+- The token-in-URL approach is fine for personal prototyping. Production
+  would use encrypted cookies or KV-backed sessions.
