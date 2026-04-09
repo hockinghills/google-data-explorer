@@ -12,7 +12,7 @@ import { loginPage } from './pages/login.js';
 import { explorerPage } from './pages/explorer.js';
 import { initiateArchives, archiveStatus, processArchives } from './ingest/portability.js';
 import { ingestMusic } from './ingest/music.js';
-import { discoverTakeout, stageTakeout, processTakeout } from './ingest/takeout.js';
+import { discoverTakeout, stageTakeout, processTakeout, peekTakeout, peekDriveZip, sampleTakeout } from './ingest/takeout.js';
 import { graphStats, ingestStatus } from './graph/stats.js';
 import { ensureGraphSchema } from './graph/schema.js';
 
@@ -38,6 +38,9 @@ export default {
 
     // Takeout pipeline: Drive → R2 → Graph
     if (url.pathname === '/takeout/discover') return discoverTakeout(url, env);
+    if (url.pathname === '/takeout/peek') return peekTakeout(url, env);
+    if (url.pathname === '/takeout/peek-drive') return peekDriveZip(url, env);
+    if (url.pathname === '/takeout/sample') return sampleTakeout(url, env);
     if (url.pathname === '/takeout/stage') {
       if (request.method !== 'POST') return new Response('Method not allowed', { status: 405 });
       return stageTakeout(url, env);

@@ -1,7 +1,7 @@
 import { fetchGoogle } from '../helpers/google.js';
 import { jsonResponse } from '../helpers/response.js';
 import { ingestActivitiesToGraph } from '../graph/ingest.js';
-import { unzipSync, Unzip, UnzipInflate } from 'fflate';
+import { unzipSync, inflateSync, Inflate, Unzip, UnzipInflate } from 'fflate';
 
 // Derive a per-user R2 prefix from the OAuth token (first 16 chars of SHA-256 hex)
 async function userPrefix(token) {
@@ -268,7 +268,11 @@ export async function stageTakeout(url, env) {
     }
 
     const r2Key = `takeout/${await userPrefix(token)}/${sanitizeFilename(meta.name)}`;
-    await env.ARCHIVES.put(r2Key, driveRes.body, {
+
+    // R2 needs a known content length for streams — wrap with FixedLengthStream
+    const { readable, writable } = new FixedLengthStream(sizeBytes);
+    driveRes.body.pipeTo(writable);
+    await env.ARCHIVES.put(r2Key, readable, {
       httpMetadata: { contentType: meta.mimeType },
       customMetadata: { driveFileId: fileId, originalSize: String(sizeBytes) },
     });
@@ -482,7 +486,7 @@ async function processTimelineData(data, key, env) {
   return jsonResponse({
     success: true,
     format: 'timeline',
-    rawEntries: segments.length,
+    rawEntries: rawEntries,
     activitiesProcessed: timestamped.length,
     graphResult: result,
   });
@@ -495,7 +499,8 @@ async function streamProcessZip(r2Object, key, env) {
   let filesFound = 0;
   let activityFilesFound = 0;
 
-  return new Promise(async (resolve) => {
+  return new Promise((resolve, reject) => {
+    (async () => {
     const uz = new Unzip();
     uz.register(UnzipInflate);
 
@@ -590,6 +595,10 @@ async function streamProcessZip(r2Object, key, env) {
       totalActivities,
       results,
     }));
+    })().catch((e) => {
+      console.error('streamProcessZip unhandled:', e);
+      resolve(jsonResponse({ error: 'Processing failed' }, 500));
+    });
   });
 }
 
@@ -646,4 +655,344 @@ async function processSmallZip(zipData, key, env) {
     totalActivities,
     results,
   });
+}
+
+// ---- PEEK: List contents of a staged ZIP without ingesting ----
+
+export async function peekTakeout(url, env) {
+  const token = url.searchParams.get('token');
+  const key = url.searchParams.get('key');
+  if (!token) return jsonResponse({ error: 'No token' }, 401);
+  if (!key) return jsonResponse({ error: 'No key' }, 400);
+
+  const prefix = await userPrefix(token);
+  if (!key.startsWith(`takeout/${prefix}/`)) {
+    return jsonResponse({ error: 'Archive not found' }, 403);
+  }
+
+  try {
+    const obj = await env.ARCHIVES.get(key);
+    if (!obj) return jsonResponse({ error: 'Not found in storage' }, 404);
+
+    const archiveSize = obj.size;
+
+    // For small files, use sync approach
+    if (archiveSize < 50 * 1024 * 1024) {
+      const arrayBuf = await obj.arrayBuffer();
+      const bytes = new Uint8Array(arrayBuf);
+      if (bytes[0] !== 0x50 || bytes[1] !== 0x4B) {
+        return jsonResponse({ error: 'Not a ZIP file', size: bytes.length });
+      }
+      const entries = unzipSync(bytes);
+      const files = Object.keys(entries).map(path => ({
+        path, size: entries[path].length,
+        category: categorizeFile(path, ''), isActivity: isActivityFile(path),
+      }));
+      return jsonResponse(buildPeekResponse(files, archiveSize));
+    }
+
+    // For large files, read ZIP central directory from the end of the file
+    // The EOCD (End of Central Directory) is in the last 64KB max
+    const tailSize = Math.min(65536, archiveSize);
+    const tailObj = await env.ARCHIVES.get(key, {
+      range: { offset: archiveSize - tailSize, length: tailSize },
+    });
+    const tailBuf = new Uint8Array(await tailObj.arrayBuffer());
+
+    // Find EOCD signature (0x50 0x4B 0x05 0x06) scanning backwards
+    let eocdOffset = -1;
+    for (let i = tailBuf.length - 22; i >= 0; i--) {
+      if (tailBuf[i] === 0x50 && tailBuf[i+1] === 0x4B && tailBuf[i+2] === 0x05 && tailBuf[i+3] === 0x06) {
+        eocdOffset = i;
+        break;
+      }
+    }
+    if (eocdOffset === -1) {
+      return jsonResponse({ error: 'Could not find ZIP directory', archiveSize });
+    }
+
+    // Parse EOCD
+    const view = new DataView(tailBuf.buffer, tailBuf.byteOffset);
+    const cdEntries = view.getUint16(eocdOffset + 10, true);
+    const cdSize = view.getUint32(eocdOffset + 12, true);
+    const cdOffset = view.getUint32(eocdOffset + 16, true);
+
+    // Read the central directory
+    const cdObj = await env.ARCHIVES.get(key, {
+      range: { offset: cdOffset, length: cdSize },
+    });
+    const cdBuf = new Uint8Array(await cdObj.arrayBuffer());
+    const cdView = new DataView(cdBuf.buffer, cdBuf.byteOffset);
+
+    // Parse central directory entries
+    const files = [];
+    let pos = 0;
+    while (pos < cdBuf.length - 46) {
+      // Check signature 0x50 0x4B 0x01 0x02
+      if (cdBuf[pos] !== 0x50 || cdBuf[pos+1] !== 0x4B || cdBuf[pos+2] !== 0x01 || cdBuf[pos+3] !== 0x02) break;
+
+      const compSize = cdView.getUint32(pos + 20, true);
+      const uncompSize = cdView.getUint32(pos + 24, true);
+      const nameLen = cdView.getUint16(pos + 28, true);
+      const extraLen = cdView.getUint16(pos + 30, true);
+      const commentLen = cdView.getUint16(pos + 32, true);
+
+      const nameBytes = cdBuf.slice(pos + 46, pos + 46 + nameLen);
+      const path = new TextDecoder().decode(nameBytes);
+
+      if (!path.endsWith('/')) {
+        files.push({
+          path,
+          size: uncompSize,
+          compressedSize: compSize,
+          category: categorizeFile(path, ''),
+          isActivity: isActivityFile(path),
+        });
+      }
+
+      pos += 46 + nameLen + extraLen + commentLen;
+    }
+
+    return jsonResponse(buildPeekResponse(files, archiveSize));
+  } catch (e) {
+    console.error('Peek failed:', e);
+    return jsonResponse({ error: 'Failed to read archive' }, 500);
+  }
+}
+
+function buildPeekResponse(files, archiveSize) {
+  const dirs = {};
+  for (const f of files) {
+    const parts = f.path.split('/');
+    const topDir = parts.length > 1 ? parts.slice(0, 2).join('/') : parts[0];
+    if (!dirs[topDir]) dirs[topDir] = { files: 0, totalSize: 0, activityFiles: 0, categories: {} };
+    dirs[topDir].files++;
+    dirs[topDir].totalSize += f.size;
+    if (f.isActivity) dirs[topDir].activityFiles++;
+    dirs[topDir].categories[f.category] = (dirs[topDir].categories[f.category] || 0) + 1;
+  }
+  return {
+    totalFiles: files.length,
+    archiveSizeBytes: archiveSize,
+    activityFiles: files.filter(f => f.isActivity).length,
+    directories: dirs,
+    allFiles: files.sort((a, b) => b.size - a.size).slice(0, 100),
+  };
+}
+
+// ---- PEEK FROM DRIVE: Read ZIP central directory directly without staging ----
+
+export async function peekDriveZip(url, env) {
+  const token = url.searchParams.get('token');
+  const fileId = url.searchParams.get('fileId');
+  if (!token) return jsonResponse({ error: 'No token' }, 401);
+  if (!fileId) return jsonResponse({ error: 'No fileId' }, 400);
+
+  try {
+    // Get file size
+    const meta = await fetchGoogle(
+      `https://www.googleapis.com/drive/v3/files/${fileId}`, token,
+      { fields: 'id,name,size' }
+    );
+    const fileSize = parseInt(meta.size || '0');
+    if (fileSize === 0) return jsonResponse({ error: 'Empty file' }, 400);
+
+    // Read last 64KB to find EOCD
+    const tailSize = Math.min(65536, fileSize);
+    const rangeStart = fileSize - tailSize;
+    const tailRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Range: `bytes=${rangeStart}-${fileSize - 1}`,
+        },
+      }
+    );
+    if (!tailRes.ok && tailRes.status !== 206) {
+      return jsonResponse({ error: `Drive range request failed: ${tailRes.status}` }, 500);
+    }
+    const tailBuf = new Uint8Array(await tailRes.arrayBuffer());
+
+    // Find EOCD signature
+    let eocdOffset = -1;
+    for (let i = tailBuf.length - 22; i >= 0; i--) {
+      if (tailBuf[i] === 0x50 && tailBuf[i+1] === 0x4B && tailBuf[i+2] === 0x05 && tailBuf[i+3] === 0x06) {
+        eocdOffset = i;
+        break;
+      }
+    }
+    if (eocdOffset === -1) {
+      return jsonResponse({ error: 'Could not find ZIP directory' });
+    }
+
+    const view = new DataView(tailBuf.buffer, tailBuf.byteOffset);
+    const cdSize = view.getUint32(eocdOffset + 12, true);
+    const cdOffset = view.getUint32(eocdOffset + 16, true);
+
+    // Read central directory
+    const cdRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Range: `bytes=${cdOffset}-${cdOffset + cdSize - 1}`,
+        },
+      }
+    );
+    if (!cdRes.ok && cdRes.status !== 206) {
+      return jsonResponse({ error: `CD fetch failed: ${cdRes.status}` }, 500);
+    }
+    const cdBuf = new Uint8Array(await cdRes.arrayBuffer());
+    const cdView = new DataView(cdBuf.buffer, cdBuf.byteOffset);
+
+    const files = [];
+    let pos = 0;
+    while (pos < cdBuf.length - 46) {
+      if (cdBuf[pos] !== 0x50 || cdBuf[pos+1] !== 0x4B || cdBuf[pos+2] !== 0x01 || cdBuf[pos+3] !== 0x02) break;
+      const uncompSize = cdView.getUint32(pos + 24, true);
+      const nameLen = cdView.getUint16(pos + 28, true);
+      const extraLen = cdView.getUint16(pos + 30, true);
+      const commentLen = cdView.getUint16(pos + 32, true);
+      const path = new TextDecoder().decode(cdBuf.slice(pos + 46, pos + 46 + nameLen));
+      if (!path.endsWith('/')) {
+        files.push({
+          path, size: uncompSize,
+          category: categorizeFile(path, ''),
+          isActivity: isActivityFile(path),
+        });
+      }
+      pos += 46 + nameLen + extraLen + commentLen;
+    }
+
+    return jsonResponse({ name: meta.name, ...buildPeekResponse(files, fileSize) });
+  } catch (e) {
+    console.error('Peek Drive ZIP failed:', e);
+    return jsonResponse({ error: 'Failed to peek archive', debug: e.message }, 500);
+  }
+}
+
+// ---- SAMPLE: Extract a single file from a staged ZIP using range requests ----
+
+export async function sampleTakeout(url, env) {
+  const token = url.searchParams.get('token');
+  const key = url.searchParams.get('key');
+  const filePath = url.searchParams.get('path');
+  const maxBytes = parseInt(url.searchParams.get('bytes') || '5000');
+  if (!token) return jsonResponse({ error: 'No token' }, 401);
+  if (!key || !filePath) return jsonResponse({ error: 'Need key and path' }, 400);
+
+  const prefix = await userPrefix(token);
+  if (!key.startsWith(`takeout/${prefix}/`)) return jsonResponse({ error: 'Not found' }, 403);
+
+  try {
+    // Get archive size
+    const head = await env.ARCHIVES.head(key);
+    if (!head) return jsonResponse({ error: 'Not found' }, 404);
+    const archiveSize = head.size;
+
+    // Read EOCD from tail
+    const tailSize = Math.min(65536, archiveSize);
+    const tailObj = await env.ARCHIVES.get(key, {
+      range: { offset: archiveSize - tailSize, length: tailSize },
+    });
+    const tailBuf = new Uint8Array(await tailObj.arrayBuffer());
+
+    let eocdOffset = -1;
+    for (let i = tailBuf.length - 22; i >= 0; i--) {
+      if (tailBuf[i] === 0x50 && tailBuf[i+1] === 0x4B && tailBuf[i+2] === 0x05 && tailBuf[i+3] === 0x06) {
+        eocdOffset = i; break;
+      }
+    }
+    if (eocdOffset === -1) return jsonResponse({ error: 'No ZIP directory found' });
+
+    const tailView = new DataView(tailBuf.buffer, tailBuf.byteOffset);
+    const cdSize = tailView.getUint32(eocdOffset + 12, true);
+    const cdOffset = tailView.getUint32(eocdOffset + 16, true);
+
+    // Read central directory
+    const cdObj = await env.ARCHIVES.get(key, { range: { offset: cdOffset, length: cdSize } });
+    const cdBuf = new Uint8Array(await cdObj.arrayBuffer());
+    const cdView = new DataView(cdBuf.buffer, cdBuf.byteOffset);
+
+    // Find the target file
+    let pos = 0;
+    let fileOffset = -1, compSize = 0, uncompSize = 0, compMethod = 0;
+    while (pos < cdBuf.length - 46) {
+      if (cdBuf[pos] !== 0x50 || cdBuf[pos+1] !== 0x4B || cdBuf[pos+2] !== 0x01 || cdBuf[pos+3] !== 0x02) break;
+      compMethod = cdView.getUint16(pos + 10, true);
+      compSize = cdView.getUint32(pos + 20, true);
+      uncompSize = cdView.getUint32(pos + 24, true);
+      const nameLen = cdView.getUint16(pos + 28, true);
+      const extraLen = cdView.getUint16(pos + 30, true);
+      const commentLen = cdView.getUint16(pos + 32, true);
+      const localOffset = cdView.getUint32(pos + 42, true);
+      const name = new TextDecoder().decode(cdBuf.slice(pos + 46, pos + 46 + nameLen));
+
+      if (name === filePath) {
+        fileOffset = localOffset;
+        break;
+      }
+      pos += 46 + nameLen + extraLen + commentLen;
+    }
+    if (fileOffset === -1) return jsonResponse({ error: 'File not found', path: filePath }, 404);
+
+    // Read local file header to get actual data offset
+    const localObj = await env.ARCHIVES.get(key, { range: { offset: fileOffset, length: 30 } });
+    const localBuf = new Uint8Array(await localObj.arrayBuffer());
+    const localView = new DataView(localBuf.buffer, localBuf.byteOffset);
+    const localNameLen = localView.getUint16(26, true);
+    const localExtraLen = localView.getUint16(28, true);
+    const dataOffset = fileOffset + 30 + localNameLen + localExtraLen;
+
+    // Read compressed data — for large files, read enough to decompress a useful sample
+    const readSize = Math.min(compSize, 256 * 1024); // up to 256KB compressed
+    const dataObj = await env.ARCHIVES.get(key, { range: { offset: dataOffset, length: readSize } });
+    const dataBuf = new Uint8Array(await dataObj.arrayBuffer());
+
+    let text;
+    if (compMethod === 0) {
+      text = new TextDecoder().decode(dataBuf.subarray(0, Math.min(dataBuf.length, maxBytes)));
+    } else if (compMethod === 8) {
+      // Deflate — use streaming inflate for partial data
+      try {
+        // If we have all compressed data, use sync
+        if (readSize >= compSize) {
+          const inflated = inflateSync(dataBuf);
+          text = new TextDecoder().decode(inflated.subarray(0, Math.min(inflated.length, maxBytes)));
+        } else {
+          // Partial — use Inflate stream, collect until we have enough
+          const chunks = [];
+          let total = 0;
+          const inf = new Inflate((data) => {
+            if (total < maxBytes) {
+              chunks.push(data);
+              total += data.length;
+            }
+          });
+          inf.push(dataBuf);
+          const full = new Uint8Array(Math.min(total, maxBytes));
+          let offset = 0;
+          for (const chunk of chunks) {
+            const take = Math.min(chunk.length, maxBytes - offset);
+            full.set(chunk.subarray(0, take), offset);
+            offset += take;
+            if (offset >= maxBytes) break;
+          }
+          text = new TextDecoder().decode(full);
+        }
+      } catch (e) {
+        return jsonResponse({ error: 'Decompression failed', debug: e.message, compSize, readSize }, 500);
+      }
+    } else {
+      return jsonResponse({ error: 'Unsupported compression', method: compMethod });
+    }
+
+    return new Response(text, {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' },
+    });
+  } catch (e) {
+    console.error('Sample failed:', e);
+    return jsonResponse({ error: 'Failed to sample', debug: e.message }, 500);
+  }
 }
