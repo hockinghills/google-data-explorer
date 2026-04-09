@@ -1,8 +1,9 @@
 import { neo4jQuery } from './neo4j.js';
 import { hashCode } from '../helpers/format.js';
+import { embedNodes, cosineDistance } from '../helpers/voyage.js';
 
 // Nodes: Activity, Topic, Hour, Day, Product
-// Edges: THEN (sequential), ABOUT (topic), AT (hour), ON (day), USING (product)
+// Edges: THEN (sequential + semantic distance), ABOUT (topic), AT (hour), ON (day), USING (product)
 
 export async function ingestActivitiesToGraph(activities, resource, env) {
   const nodes = activities.map((a, idx) => {
@@ -25,6 +26,8 @@ export async function ingestActivitiesToGraph(activities, resource, env) {
 
   nodes.sort((a, b) => new Date(a.time) - new Date(b.time));
   if (nodes.length === 0) return { nodesCreated: 0, message: 'No timestamped activities' };
+
+  // ---- Phase 1: Create nodes and structural relationships ----
 
   const batchSize = 150;
   let totalCreated = 0;
@@ -53,7 +56,8 @@ export async function ingestActivitiesToGraph(activities, resource, env) {
     totalCreated += batch.length;
   }
 
-  // Build THEN chains
+  // ---- Phase 2: Build THEN chains (temporal) ----
+
   const chainResult = await neo4jQuery(env,
     `MATCH (a:Activity) WHERE a.resource = $resource
      WITH a ORDER BY a.time
@@ -66,15 +70,95 @@ export async function ingestActivitiesToGraph(activities, resource, env) {
     { resource }
   );
 
-  // Extract topics
+  // ---- Phase 3: Extract topics (regex-based, fast) ----
+
   const topicResult = await extractAndLinkTopics(nodes, env);
+
+  // ---- Phase 4: Embed nodes via Voyage (semantic layer) ----
+
+  let embeddingStats = { embedded: 0, distances: 0 };
+
+  const voyageKey = env.VOYAGE_API_KEY;
+  if (voyageKey) {
+    try {
+      const embeddings = await embedNodes(nodes, voyageKey);
+      embeddingStats.embedded = embeddings.size;
+
+      if (embeddings.size > 0) {
+        // Store embeddings on Activity nodes
+        await storeEmbeddings(nodes, embeddings, env);
+
+        // Compute semantic distance on THEN edges — the step length for Lévy flight analysis
+        embeddingStats.distances = await computeSemanticDistances(nodes, embeddings, env);
+      }
+    } catch (e) {
+      console.error('Embedding phase failed (non-fatal):', e.message);
+      embeddingStats.error = e.message;
+    }
+  }
 
   return {
     nodesCreated: totalCreated,
     chainsCreated: chainResult.data?.values?.[0]?.[0] || 0,
     topicsLinked: topicResult.linked || 0,
     topicCount: topicResult.topicCount || 0,
+    ...embeddingStats,
   };
+}
+
+// Store embedding vectors on Activity nodes in batches
+async function storeEmbeddings(nodes, embeddings, env) {
+  const embeddingBatchSize = 50; // 50 × 2048 floats ≈ 800KB JSON payload
+  const nodesWithEmbeddings = nodes
+    .filter(n => embeddings.has(n.id))
+    .map(n => ({ id: n.id, embedding: embeddings.get(n.id) }));
+
+  for (let i = 0; i < nodesWithEmbeddings.length; i += embeddingBatchSize) {
+    const batch = nodesWithEmbeddings.slice(i, i + embeddingBatchSize);
+    await neo4jQuery(env,
+      `UNWIND $nodes AS n
+       MATCH (a:Activity {id: n.id})
+       SET a.embedding = n.embedding`,
+      { nodes: batch }
+    );
+  }
+}
+
+// Compute cosine distance for each consecutive pair and store on THEN edges
+// This is the step length in semantic space — the raw data for Lévy flight analysis
+async function computeSemanticDistances(nodes, embeddings, env) {
+  const pairs = [];
+
+  for (let i = 0; i < nodes.length - 1; i++) {
+    const a = nodes[i];
+    const b = nodes[i + 1];
+    const vecA = embeddings.get(a.id);
+    const vecB = embeddings.get(b.id);
+    if (!vecA || !vecB) continue;
+
+    const distance = cosineDistance(vecA, vecB);
+    pairs.push({ fromId: a.id, toId: b.id, semanticDistance: distance });
+  }
+
+  if (pairs.length === 0) return 0;
+
+  // Batch-update THEN edges with semantic distance
+  const distBatchSize = 200;
+  let updated = 0;
+
+  for (let i = 0; i < pairs.length; i += distBatchSize) {
+    const batch = pairs.slice(i, i + distBatchSize);
+    const result = await neo4jQuery(env,
+      `UNWIND $pairs AS p
+       MATCH (a1:Activity {id: p.fromId})-[r:THEN]->(a2:Activity {id: p.toId})
+       SET r.semanticDistance = p.semanticDistance
+       RETURN count(r) AS updated`,
+      { pairs: batch }
+    );
+    updated += result.data?.values?.[0]?.[0] || 0;
+  }
+
+  return updated;
 }
 
 export async function extractAndLinkTopics(nodes, env) {

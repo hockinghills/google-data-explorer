@@ -17,6 +17,18 @@ export async function ensureGraphSchema(url, env) {
       'CREATE INDEX artist_name IF NOT EXISTS FOR (a:Artist) ON (a.name)',
     ];
     for (const stmt of indexes) { await neo4jQuery(env, stmt); }
+
+    // Vector index for semantic search and visualization clustering
+    try {
+      await neo4jQuery(env,
+        `CREATE VECTOR INDEX activity_embedding IF NOT EXISTS
+         FOR (a:Activity) ON (a.embedding)
+         OPTIONS {indexConfig: {\`vector.dimensions\`: 2048, \`vector.similarity_function\`: 'cosine'}}`
+      );
+    } catch (e) {
+      // Vector indexes require Neo4j 5.11+ — non-fatal if unavailable
+      console.log('Vector index creation skipped:', e.message);
+    }
     await neo4jQuery(env, `UNWIND range(0, 23) AS h MERGE (:Hour {value: h})`);
     await neo4jQuery(env,
       `UNWIND ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'] AS d MERGE (:Day {name: d})`

@@ -13,7 +13,7 @@ import { explorerPage } from './pages/explorer.js';
 import { initiateArchives, archiveStatus, processArchives } from './ingest/portability.js';
 import { ingestMusic } from './ingest/music.js';
 import { discoverTakeout, stageTakeout, processTakeout, peekTakeout, peekDriveZip, sampleTakeout } from './ingest/takeout.js';
-import { graphStats, ingestStatus } from './graph/stats.js';
+import { graphStats, ingestStatus, levyFlights } from './graph/stats.js';
 import { ensureGraphSchema } from './graph/schema.js';
 
 export default {
@@ -54,6 +54,7 @@ export default {
     if (url.pathname === '/ingest/music') return ingestMusic(url, env);
     if (url.pathname === '/ingest/status') return ingestStatus(url, env);
     if (url.pathname === '/graph/stats') return graphStats(url, env);
+    if (url.pathname === '/graph/flights') return levyFlights(url, env);
     if (url.pathname === '/graph/schema') return ensureGraphSchema(url, env);
 
     return new Response('Not found', { status: 404 });

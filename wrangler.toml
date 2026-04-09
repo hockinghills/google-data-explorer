@@ -15,3 +15,4 @@ bucket_name = "data-explorer-archives"
 #   NEO4J_USERNAME
 #   NEO4J_PASSWORD
 #   NEO4J_DATABASE
+#   VOYAGE_API_KEY
