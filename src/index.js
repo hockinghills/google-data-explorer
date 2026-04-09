@@ -14,7 +14,10 @@ import { initiateArchives, archiveStatus, processArchives } from './ingest/porta
 import { ingestMusic } from './ingest/music.js';
 import { discoverTakeout, stageTakeout, processTakeout, peekTakeout, peekDriveZip, sampleTakeout } from './ingest/takeout.js';
 import { graphStats, ingestStatus, levyFlights } from './graph/stats.js';
+import { graphExport } from './graph/export.js';
 import { ensureGraphSchema } from './graph/schema.js';
+import { ingestLive } from './ingest/live.js';
+import { vizPage } from './pages/viz.js';
 
 export default {
   async fetch(request, env) {
@@ -22,6 +25,7 @@ export default {
 
     if (url.pathname === '/') return loginPage();
     if (url.pathname === '/explorer') return explorerPage(url, env);
+    if (url.pathname === '/viz') return vizPage(url);
 
     // Layer 1: Live API OAuth
     if (url.pathname === '/login') return redirectToGoogle(env, 'live');
@@ -51,8 +55,10 @@ export default {
     }
 
     // Graph endpoints
+    if (url.pathname === '/ingest/live') return ingestLive(url, env);
     if (url.pathname === '/ingest/music') return ingestMusic(url, env);
     if (url.pathname === '/ingest/status') return ingestStatus(url, env);
+    if (url.pathname === '/graph/export') return graphExport(url, env);
     if (url.pathname === '/graph/stats') return graphStats(url, env);
     if (url.pathname === '/graph/flights') return levyFlights(url, env);
     if (url.pathname === '/graph/schema') return ensureGraphSchema(url, env);

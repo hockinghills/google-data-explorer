@@ -52,5 +52,5 @@ export async function handleCallback(url, env, flow) {
   if (isPortability) {
     return Response.redirect(`${url.origin}/explorer?ptoken=${tokens.access_token}`);
   }
-  return Response.redirect(`${url.origin}/explorer?token=${tokens.access_token}`);
+  return Response.redirect(`${url.origin}/viz?token=${tokens.access_token}`);
 }
