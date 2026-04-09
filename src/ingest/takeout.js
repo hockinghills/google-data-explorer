@@ -267,7 +267,7 @@ export async function stageTakeout(url, env) {
       return jsonResponse({ error: `Drive download failed: ${driveRes.status}` }, 500);
     }
 
-    const r2Key = `takeout/${await userPrefix(token)}/${sanitizeFilename(meta.name)}`;
+    const r2Key = `takeout/${await userPrefix(token)}/${fileId}_${sanitizeFilename(meta.name)}`;
 
     // R2 needs a known content length for streams — wrap with FixedLengthStream
     const { readable, writable } = new FixedLengthStream(sizeBytes);
@@ -310,7 +310,7 @@ export async function processTakeout(url, env) {
     // Peek at first 2 bytes to detect format
     // For JSON files: read fully (they're small enough)
     // For ZIPs: stream (they can be 2GB+)
-    const isZipName = key.endsWith('.zip') || key.endsWith('.tgz');
+    const isZipName = key.endsWith('.zip');
 
     if (isZipName) {
       return streamProcessZip(obj, key, env);
