@@ -10,7 +10,7 @@ export const LIVE_SCOPES = [
   'https://www.googleapis.com/auth/fitness.sleep.read',
   'https://www.googleapis.com/auth/fitness.location.read',
   'https://www.googleapis.com/auth/tasks.readonly',
-  'https://www.googleapis.com/auth/drive.metadata.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
 ].join(' ');
 
 // Layer 2: Data Portability scopes (bulk historical export)

@@ -116,6 +116,44 @@ function renderExplorer(cards, token, ptoken) {
   .add-btn.done { background: #1a2e1a; border-color: #22c55e; color: #22c55e; cursor: default; }
   .add-btn.error { background: #2e1a1a; border-color: #ef4444; color: #ef4444; }
   .card-status { font-size: 0.75rem; color: #666; margin-top: 0.4rem; min-height: 1em; }
+
+  .takeout-section { max-width: 1100px; margin-top: 2.5rem; padding-top: 2rem; border-top: 1px solid #1a1a1a; }
+  .takeout-title { font-size: 1.4rem; color: #fff; margin-bottom: 0.3rem; }
+  .takeout-subtitle { font-size: 0.85rem; color: #555; margin-bottom: 1.25rem; }
+  .takeout-scan-btn {
+    padding: 0.6rem 1.2rem; background: #1a1a2e; border: 1px solid #333;
+    color: #8b8bce; border-radius: 8px; cursor: pointer; font-size: 0.9rem; transition: all 0.2s;
+  }
+  .takeout-scan-btn:hover { background: #222244; border-color: #555; color: #aaaaee; }
+  .takeout-scan-btn.running { cursor: wait; color: #88cc88; border-color: #2d5a2d; }
+  .takeout-status { font-size: 0.8rem; color: #666; margin-top: 0.6rem; min-height: 1.2em; }
+  .takeout-catalog { margin-top: 1rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 0.75rem; }
+  .takeout-cat {
+    background: #111; border: 1px solid #1a1a1a; border-radius: 10px;
+    padding: 1rem; transition: all 0.2s;
+  }
+  .takeout-cat:hover { border-color: #282828; }
+  .takeout-cat.ready { border-color: #222244; }
+  .takeout-cat-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+  .takeout-cat-icon { font-size: 1.2rem; }
+  .takeout-cat-label { font-weight: 600; font-size: 0.95rem; flex: 1; color: #ccc; }
+  .takeout-cat-badge {
+    font-size: 0.7rem; padding: 0.15rem 0.5rem; border-radius: 4px;
+    background: #1a2e1a; color: #66bb6a; border: 1px solid #2d5a2d;
+  }
+  .takeout-cat-badge.not-ready { background: #1a1a1a; color: #555; border-color: #222; }
+  .takeout-cat-info { font-size: 0.8rem; color: #666; margin-bottom: 0.6rem; }
+  .takeout-cat-files { font-size: 0.75rem; color: #444; max-height: 80px; overflow-y: auto; margin-bottom: 0.5rem; }
+  .takeout-cat-file { padding: 0.15rem 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .takeout-ingest-btn {
+    width: 100%; padding: 0.4rem; background: #1a1a2e; border: 1px solid #333;
+    color: #8b8bce; border-radius: 6px; cursor: pointer; font-size: 0.8rem; transition: all 0.2s;
+  }
+  .takeout-ingest-btn:hover { background: #222244; border-color: #555; }
+  .takeout-ingest-btn:disabled { opacity: 0.3; cursor: default; }
+  .takeout-ingest-btn.running { color: #88cc88; border-color: #2d5a2d; cursor: wait; }
+  .takeout-ingest-btn.done { color: #22c55e; border-color: #22c55e; }
+  .takeout-ingest-btn.error { color: #ef4444; border-color: #ef4444; }
 </style></head><body>
 
 <h1>this is yours</h1>
@@ -128,9 +166,21 @@ function renderExplorer(cards, token, ptoken) {
 
 ${cards.length > 0 ? '<div class="grid">' + cardHtml + '</div>' : ''}
 
+${token ? `<div class="takeout-section" id="takeoutSection">
+  <h2 class="takeout-title">your archive</h2>
+  <div class="takeout-subtitle">google takeout data sitting in your drive — scan it, pick what goes into the graph</div>
+  <button class="takeout-scan-btn" id="takeoutScanBtn" onclick="scanTakeout()">scan drive for takeout data</button>
+  <div class="takeout-status" id="takeoutStatus"></div>
+  <div class="takeout-catalog" id="takeoutCatalog"></div>
+</div>` : ''}
+
 <script>
 const token = ${JSON.stringify(token || '')};
 const ptoken = ${JSON.stringify(ptoken || '')};
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 
 const BUBBLE_COLORS = {
   songs: '#8b5cf6', artists: '#a78bfa', activities: '#6366f1',
@@ -288,6 +338,102 @@ try {
 } catch(e) {}
 
 loadGraphStats();
+
+async function scanTakeout() {
+  const btn = document.getElementById('takeoutScanBtn');
+  const status = document.getElementById('takeoutStatus');
+  const catalog = document.getElementById('takeoutCatalog');
+  if (btn.classList.contains('running')) return;
+  btn.classList.add('running');
+  btn.textContent = 'scanning drive...';
+  status.textContent = '';
+  catalog.innerHTML = '';
+
+  try {
+    const res = await fetch('/takeout/discover?token=' + encodeURIComponent(token));
+    const data = await res.json();
+    if (data.error) { status.textContent = data.error; btn.classList.remove('running'); btn.textContent = 'scan again'; return; }
+
+    btn.classList.remove('running');
+    btn.textContent = 'scan again';
+    status.textContent = data.totalFiles + ' files found \\u00b7 ' + data.totalSizeMB + ' MB total';
+
+    const summary = data.summary || {};
+    const cats = data.catalog || {};
+    const keys = Object.keys(summary).sort(function(a, b) {
+      if (summary[a].graphReady && !summary[b].graphReady) return -1;
+      if (!summary[a].graphReady && summary[b].graphReady) return 1;
+      return summary[b].fileCount - summary[a].fileCount;
+    });
+
+    catalog.innerHTML = keys.map(function(key) {
+      var s = summary[key];
+      var c = cats[key];
+      var files = (c && c.files || []).slice(0, 5);
+      var badge = s.graphReady
+        ? '<span class="takeout-cat-badge">graph ready</span>'
+        : '<span class="takeout-cat-badge not-ready">coming soon</span>';
+      var fileList = files.map(function(f) {
+        return '<div class="takeout-cat-file" title="' + escHtml(f.name) + '">' + escHtml(f.name) + ' (' + f.sizeMB + ' MB)</div>';
+      }).join('') + (s.fileCount > 5 ? '<div class="takeout-cat-file">... +' + (s.fileCount - 5) + ' more</div>' : '');
+      var ingestBtn = s.graphReady
+        ? '<button class="takeout-ingest-btn" onclick="ingestCategory(\\'' + key + '\\', this)">add to graph</button>'
+        : '<button class="takeout-ingest-btn" disabled>not yet available</button>';
+      return '<div class="takeout-cat' + (s.graphReady ? ' ready' : '') + '" data-cat="' + key + '">'
+        + '<div class="takeout-cat-header">'
+        + '<span class="takeout-cat-icon">' + s.icon + '</span>'
+        + '<span class="takeout-cat-label">' + s.label + '</span>'
+        + badge + '</div>'
+        + '<div class="takeout-cat-info">' + s.fileCount + ' files \\u00b7 ' + s.totalSizeMB.toFixed(1) + ' MB</div>'
+        + '<div class="takeout-cat-files">' + fileList + '</div>'
+        + ingestBtn + '</div>';
+    }).join('');
+
+    window._takeoutCatalog = cats;
+  } catch(e) {
+    status.textContent = 'scan failed: ' + e.message;
+    btn.classList.remove('running');
+    btn.textContent = 'scan again';
+  }
+}
+
+async function ingestCategory(catKey, btn) {
+  if (btn.classList.contains('running') || btn.classList.contains('done')) return;
+  var cat = window._takeoutCatalog && window._takeoutCatalog[catKey];
+  if (!cat || !cat.files || !cat.files.length) return;
+  btn.classList.add('running');
+  btn.textContent = 'staging...';
+
+  try {
+    var ingested = 0;
+    for (var i = 0; i < cat.files.length; i++) {
+      var file = cat.files[i];
+      btn.textContent = 'staging ' + (i + 1) + '/' + cat.files.length + '...';
+      var stageRes = await fetch('/takeout/stage?token=' + encodeURIComponent(token) + '&fileId=' + encodeURIComponent(file.id), { method: 'POST' });
+      var stageData = await stageRes.json();
+      if (!stageData.success) { btn.textContent = 'stage failed'; btn.classList.add('error'); return; }
+
+      btn.textContent = 'processing ' + (i + 1) + '/' + cat.files.length + '...';
+      var processRes = await fetch('/takeout/process?token=' + encodeURIComponent(token) + '&key=' + encodeURIComponent(stageData.key), { method: 'POST' });
+      var processData = await processRes.json();
+      if (processData.success) ingested++;
+    }
+
+    btn.classList.remove('running');
+    if (ingested > 0) {
+      btn.classList.add('done');
+      btn.textContent = 'added \\u2014 ' + ingested + ' files processed';
+      loadGraphStats();
+    } else {
+      btn.classList.add('error');
+      btn.textContent = 'no data found';
+    }
+  } catch(e) {
+    btn.classList.remove('running');
+    btn.classList.add('error');
+    btn.textContent = 'error: ' + e.message;
+  }
+}
 </script></body></html>`;
 
 }
